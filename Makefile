@@ -1,4 +1,4 @@
-.PHONY: build test clean lint
+.PHONY: build test clean lint dist
 
 BINARY_NAME=repo
 BINARY_WINDOWS=$(BINARY_NAME).exe
@@ -39,7 +39,33 @@ lint:
 
 clean:
 	rm -rf bin/
+	rm -rf dist/
 	rm -f coverage.txt
 
 run:
 	go run ./cmd/repo/main.go
+
+# 发布打包:全平台交叉编译,产出 dist/ 下的 tar.gz(zip)与 checksums.txt
+# 产物名不带版本号:配合 releases/latest/download/<name> 固定链接,
+# selfupdate 的 REPO_SELFUPDATE_URL 无需随版本改 URL;版本由二进制注入信息提供
+# VERSION 可覆盖,CI 中传 tag 名,如 make dist VERSION=v1.2.3
+PLATFORMS = linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+
+dist: clean
+	@mkdir -p dist
+	@rm -f dist/checksums.txt
+	@for platform in $(PLATFORMS); do \
+		os=$${platform%/*}; arch=$${platform#*/}; \
+		name=$(BINARY_NAME)-$${os}-$${arch}; \
+		if [ "$${os}" = "windows" ]; then \
+			GOOS=$${os} GOARCH=$${arch} go build $(LDFLAGS) -o dist/$${name}.exe ./cmd/repo || exit 1; \
+			(cd dist && zip -q $${name}.zip $${name}.exe) || exit 1; \
+			(cd dist && sha256sum $${name}.zip) >> dist/checksums.txt || exit 1; \
+		else \
+			GOOS=$${os} GOARCH=$${arch} go build $(LDFLAGS) -o dist/$${name} ./cmd/repo || exit 1; \
+			tar -czf dist/$${name}.tar.gz -C dist $${name} || exit 1; \
+			(cd dist && sha256sum $${name}.tar.gz) >> dist/checksums.txt || exit 1; \
+		fi; \
+		rm -f dist/$${name} dist/$${name}.exe; \
+	done
+	@ls -lh dist/
