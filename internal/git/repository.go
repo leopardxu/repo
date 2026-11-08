@@ -1,6 +1,7 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -60,12 +61,14 @@ type Repository struct {
 	Runner Runner
 
 	// 缓存
-	statusCache     string
-	statusCacheTime time.Time
-	branchCache     string
-	branchCacheTime time.Time
-	cacheMutex      sync.RWMutex
-	cacheExpiration time.Duration
+	statusCache      string
+	statusCacheValid bool // 空字符串也是合法状态（干净仓库），必须单独标记有效
+	statusCacheTime  time.Time
+	branchCache      string
+	branchCacheValid bool
+	branchCacheTime  time.Time
+	cacheMutex       sync.RWMutex
+	cacheExpiration  time.Duration
 }
 
 // RepositoryError 表示仓库操作错误
@@ -114,19 +117,42 @@ func (r *Repository) ClearCache() {
 	r.cacheMutex.Lock()
 	defer r.cacheMutex.Unlock()
 	r.statusCache = ""
+	r.statusCacheValid = false
 	r.branchCache = ""
+	r.branchCacheValid = false
 }
 
-// RunCommand 执行Git命令并返回结
-func (r *Repository) RunCommand(args ...string) ([]byte, error) {
+// stderrRunner 是 Runner 的可选能力：在目录内执行命令并同时返回
+// stdout/stderr。defaultRunner 实现该接口；其他 Runner 实现可自行选择。
+type stderrRunner interface {
+	RunInDirWithStderr(dir string, args ...string) (stdout, stderr []byte, err error)
+}
+
+// RunCommandWithStderr 在仓库目录执行 git 命令并同时返回 stdout 与 stderr。
+// 命令失败时也返回已捕获的输出（供调用方展示 push/fetch 的远端诊断）；
+// 底层 Runner 不支持可选接口时退化为 RunInDir，并从 *GitCommandError
+// 中取回 stderr。
+func (r *Repository) RunCommandWithStderr(args ...string) ([]byte, []byte, error) {
 	repoLog.Debug("在仓'%s' 执行命令: git %s", r.Path, strings.Join(args, " "))
 
-	output, err := r.Runner.RunInDir(r.Path, args...)
+	var stdout, stderr []byte
+	var err error
+	if sr, ok := r.Runner.(stderrRunner); ok {
+		stdout, stderr, err = sr.RunInDirWithStderr(r.Path, args...)
+	} else {
+		stdout, err = r.Runner.RunInDir(r.Path, args...)
+		if err != nil {
+			var cmdErr *GitCommandError
+			if errors.As(err, &cmdErr) {
+				stderr = []byte(cmdErr.Stderr)
+			}
+		}
+	}
+	// 失败的命令也可能已经改动索引/工作区，无论成功与否都失效缓存。
+	r.ClearCache()
 	if err != nil {
-		// 失败详情以 Warn 记录（含 stderr 细节），错误本身返回给调用方决定错误级别，
-		// 避免 log+return 双重处理
 		repoLog.Warn("命令执行failed: git %s: %v", strings.Join(args, " "), err)
-		return nil, &RepositoryError{
+		return stdout, stderr, &RepositoryError{
 			Op:      "run_command",
 			Path:    r.Path,
 			Command: fmt.Sprintf("git %s", strings.Join(args, " ")),
@@ -135,7 +161,48 @@ func (r *Repository) RunCommand(args ...string) ([]byte, error) {
 	}
 
 	repoLog.Debug("命令执行成功: git %s", strings.Join(args, " "))
-	return output, nil
+	return stdout, stderr, nil
+}
+
+// RunCommand 执行 Git 命令并返回标准输出。
+// 失败时同样返回已捕获的 stdout（与 RunCommandWithStderr 的契约一致），
+// 调用方可据此在错误信息中附带 git 输出。
+func (r *Repository) RunCommand(args ...string) ([]byte, error) {
+	output, _, err := r.RunCommandWithStderr(args...)
+	return output, err
+}
+
+// RunInteractive 在仓库目录执行需要终端交互的 Git 命令（如 add -i/-p）。
+//
+// 交互能力通过可选接口探测（RunInteractiveInDir），不扩展 Runner 接口本身，
+// 保证既有 mock / 实现无需改动；不支持时应返回明确错误，而不是静默失败。
+func (r *Repository) RunInteractive(args ...string) error {
+	interactive, ok := r.Runner.(interface {
+		RunInteractiveInDir(dir string, args ...string) error
+	})
+	if !ok {
+		return &RepositoryError{
+			Op:      "run_interactive",
+			Path:    r.Path,
+			Command: fmt.Sprintf("git %s", strings.Join(args, " ")),
+			Err:     fmt.Errorf("runner %T does not support interactive commands", r.Runner),
+		}
+	}
+
+	repoLog.Debug("在仓'%s' 交互执行命令: git %s", r.Path, strings.Join(args, " "))
+	err := interactive.RunInteractiveInDir(r.Path, args...)
+	// 交互命令无论成功与否都可能改动索引/工作区（如中途退出的 add -p），
+	// 因此与 RunCommand 一致，始终失效缓存。
+	r.ClearCache()
+	if err != nil {
+		return &RepositoryError{
+			Op:      "run_interactive",
+			Path:    r.Path,
+			Command: fmt.Sprintf("git %s", strings.Join(args, " ")),
+			Err:     err,
+		}
+	}
+	return nil
 }
 
 // CloneOptions contains options for git clone
@@ -195,8 +262,8 @@ func (r *Repository) Clone(repoURL string, opts CloneOptions) error {
 
 	repoLog.Debug("解析后的URL: %s", resolvedURL)
 
-	// 执行克隆命令
-	args = append(args, resolvedURL, r.Path)
+	// 执行克隆命令（-- 分隔，避免 URL/路径以 - 开头被当作选项）
+	args = append(args, "--", resolvedURL, r.Path)
 	_, err = r.Runner.Run(args...)
 	if err != nil {
 		return &RepositoryError{
@@ -215,9 +282,10 @@ func (r *Repository) Clone(repoURL string, opts CloneOptions) error {
 func (r *Repository) Fetch(remote string, opts FetchOptions) error {
 	repoLog.Info("从远'%s' 获取更新'%s'", remote, r.Path)
 
-	// 解析远程URL
+	// 解析远程URL：仅相对 fetch（..、./、../ 前缀）需要基于 manifest 服务器解析；
+	// 裸 remote 名（origin 等）与完整 URL 原样交给 git fetch。
 	resolvedRemote := remote
-	if strings.HasPrefix(remote, "../") || !strings.Contains(remote, "://") {
+	if isRelativeRepoURL(remote) {
 		var err error
 		resolvedRemote, err = resolveRepositoryURL(remote, opts.Config)
 		if err != nil {
@@ -230,8 +298,9 @@ func (r *Repository) Fetch(remote string, opts FetchOptions) error {
 		repoLog.Debug("解析后的远程URL: %s", resolvedRemote)
 	}
 
-	// 构建fetch参数
-	args := []string{"fetch", resolvedRemote}
+	// 构建fetch参数：选项在前，-- 之后再给 remote，
+	// 避免 "origin" 这类名字被当成选项（也支持以 - 开头的合法远程名）。
+	args := []string{"fetch"}
 	if opts.Prune {
 		args = append(args, "--prune")
 		repoLog.Debug("使用修剪选项")
@@ -244,6 +313,7 @@ func (r *Repository) Fetch(remote string, opts FetchOptions) error {
 		args = append(args, "--depth", fmt.Sprintf("%d", opts.Depth))
 		repoLog.Debug("使用深度: %d", opts.Depth)
 	}
+	args = append(args, "--", resolvedRemote)
 
 	// 执行fetch命令
 	_, err := r.Runner.RunInDir(r.Path, args...)
@@ -265,15 +335,28 @@ func (r *Repository) Fetch(remote string, opts FetchOptions) error {
 
 // Checkout checks out a specific revision
 func (r *Repository) Checkout(revision string) error {
-	_, err := r.Runner.RunInDir(r.Path, "checkout", revision)
-	return err
+	if revision == "" || strings.HasPrefix(revision, "-") {
+		return &RepositoryError{
+			Op:      "checkout",
+			Path:    r.Path,
+			Command: "git checkout",
+			Err:     fmt.Errorf("invalid revision %q", revision),
+		}
+	}
+	// 尾随 -- 消除 revision 与 pathspec 的歧义（避免被当作路径恢复）
+	_, err := r.Runner.RunInDir(r.Path, "checkout", revision, "--")
+	if err != nil {
+		return err
+	}
+	r.ClearCache()
+	return nil
 }
 
 // Status 获取仓库状
 func (r *Repository) Status() (string, error) {
-	// 检查缓
+	// 检查缓存：空字符串是干净仓库的合法状态，用独立 valid 标志判断
 	r.cacheMutex.RLock()
-	if r.statusCache != "" && time.Since(r.statusCacheTime) < r.cacheExpiration {
+	if r.statusCacheValid && time.Since(r.statusCacheTime) < r.cacheExpiration {
 		status := r.statusCache
 		r.cacheMutex.RUnlock()
 		repoLog.Debug("使用缓存的仓库状态")
@@ -298,6 +381,7 @@ func (r *Repository) Status() (string, error) {
 	status := string(output)
 	r.cacheMutex.Lock()
 	r.statusCache = status
+	r.statusCacheValid = true
 	r.statusCacheTime = time.Now()
 	r.cacheMutex.Unlock()
 
@@ -328,11 +412,18 @@ func (r *Repository) BranchExists(branch string) (bool, error) {
 	return true, nil
 }
 
+// branchNameFromSymbolicRef 从 `git symbolic-ref HEAD` 的完整引用名提取短分支名。
+// 不直接使用 `symbolic-ref --short`：存在同名 tag/分支时它会返回 "heads/main"
+// 这类歧义短名，从而破坏远程分支名拼接与界面展示。
+func branchNameFromSymbolicRef(ref string) string {
+	return strings.TrimPrefix(strings.TrimSpace(ref), "refs/heads/")
+}
+
 // CurrentBranch 获取当前分支名称
 func (r *Repository) CurrentBranch() (string, error) {
-	// 检查缓
+	// 检查缓存
 	r.cacheMutex.RLock()
-	if r.branchCache != "" && time.Since(r.branchCacheTime) < r.cacheExpiration {
+	if r.branchCacheValid && time.Since(r.branchCacheTime) < r.cacheExpiration {
 		branch := r.branchCache
 		r.cacheMutex.RUnlock()
 		repoLog.Debug("使用缓存的分支名称")
@@ -340,9 +431,11 @@ func (r *Repository) CurrentBranch() (string, error) {
 	}
 	r.cacheMutex.RUnlock()
 
-	// 获取当前分支
+	// 获取当前分支。使用完整 symbolic-ref 后自行剥离 refs/heads/：
+	// `symbolic-ref --short` 在存在同名 tag 时会返回 "heads/main" 这类歧义短名，
+	// 导致远程分支拼接（origin/heads/main）与展示都错误。
 	repoLog.Debug("获取仓库 '%s' 的当前分支", r.Path)
-	output, err := r.Runner.RunInDir(r.Path, "symbolic-ref", "--short", "HEAD")
+	output, err := r.Runner.RunInDir(r.Path, "symbolic-ref", "HEAD")
 	if err != nil {
 		// 可能处于分离头指针状态
 		output, err = r.Runner.RunInDir(r.Path, "rev-parse", "--short", "HEAD")
@@ -351,7 +444,7 @@ func (r *Repository) CurrentBranch() (string, error) {
 			return "", &RepositoryError{
 				Op:      "current_branch",
 				Path:    r.Path,
-				Command: "git symbolic-ref --short HEAD",
+				Command: "git symbolic-ref HEAD",
 				Err:     err,
 			}
 		}
@@ -361,6 +454,7 @@ func (r *Repository) CurrentBranch() (string, error) {
 		// 更新缓存
 		r.cacheMutex.Lock()
 		r.branchCache = branch
+		r.branchCacheValid = true
 		r.branchCacheTime = time.Now()
 		r.cacheMutex.Unlock()
 
@@ -369,9 +463,10 @@ func (r *Repository) CurrentBranch() (string, error) {
 	}
 
 	// 更新缓存
-	branch := strings.TrimSpace(string(output))
+	branch := branchNameFromSymbolicRef(string(output))
 	r.cacheMutex.Lock()
 	r.branchCache = branch
+	r.branchCacheValid = true
 	r.branchCacheTime = time.Now()
 	r.cacheMutex.Unlock()
 
@@ -382,7 +477,16 @@ func (r *Repository) CurrentBranch() (string, error) {
 // HasRevision 检查是否有指定的修订版
 func (r *Repository) HasRevision(revision string) (bool, error) {
 	repoLog.Debug("检查仓'%s' 是否有修订版 %s", r.Path, revision)
-	_, err := r.Runner.RunInDir(r.Path, "rev-parse", "--verify", revision)
+	if revision == "" || strings.HasPrefix(revision, "-") {
+		return false, &RepositoryError{
+			Op:      "has_revision",
+			Path:    r.Path,
+			Command: "git rev-parse --verify",
+			Err:     fmt.Errorf("invalid revision %q", revision),
+		}
+	}
+	// 前置校验拒绝以 - 开头的非法值；尾随 -- 消除 revision 与 pathspec 的歧义
+	_, err := r.Runner.RunInDir(r.Path, "rev-parse", "--verify", revision, "--")
 	if err != nil {
 		repoLog.Debug("仓库 '%s' 没有修订版本: %s", r.Path, revision)
 		return false, nil
@@ -392,45 +496,51 @@ func (r *Repository) HasRevision(revision string) (bool, error) {
 	return true, nil
 }
 
+// isRelativeRepoURL 判断仓库 URL/remote 是否为需要基于 manifest 服务器解析的相对路径。
+func isRelativeRepoURL(repoURL string) bool {
+	return repoURL == ".." || repoURL == "." ||
+		strings.HasPrefix(repoURL, "../") || strings.HasPrefix(repoURL, "./")
+}
+
 // resolveRepositoryURL resolves a repository URL, handling relative paths and special formats.
 func resolveRepositoryURL(repoURL string, cfg *config.Config) (string, error) {
-	// Check cache
-	if cachedURL, ok := getCachedURL(repoURL); ok {
-		return cachedURL, nil
-	}
-
-	// 处理相对路径
-	if strings.Contains(repoURL, "..") || strings.HasPrefix(repoURL, "../") {
-		// 尝试从配置中获取基础URL
-		baseURL := ""
-		if cfg != nil {
-			baseURL = cfg.ExtractBaseURLFromManifestURL(cfg.ManifestURL)
+	// 相对路径依赖 base URL 解析，缓存 key 必须包含 base URL，
+	// 否则不同 manifest 源的相对路径会互相污染（仅用 repoURL 作 key 是错误的）。
+	if isRelativeRepoURL(repoURL) {
+		if cfg == nil {
+			// 无配置无法确定 base，原样返回由调用方处理
+			return repoURL, nil
 		}
 
+		baseURL := cfg.DefaultRemoteURL
 		if baseURL == "" {
-			// 无法确定基础URL，返回原始URL让调用方处理
+			baseURL = cfg.ManifestURL
+		}
+		if baseURL == "" {
 			repoLog.Debug("failed to get base URL from config，返回原始URL: %s", repoURL)
 			return repoURL, nil
 		}
 
-		// 确保baseURL不以/结尾
-		baseURL = strings.TrimSuffix(baseURL, "/")
-
-		// 处理不同格式的相对路
-		var resolvedURL string
-		if strings.HasPrefix(repoURL, "../") {
-			// 移除相对路径前缀
-			relPath := strings.TrimPrefix(repoURL, "../")
-			resolvedURL = baseURL + "/" + relPath
-		} else {
-			// 替换..为baseURL
-			resolvedURL = strings.ReplaceAll(repoURL, "..", baseURL)
+		cacheKey := baseURL + "\x00" + repoURL
+		if cachedURL, ok := getCachedURL(cacheKey); ok {
+			return cachedURL, nil
 		}
 
-		// Update cache
-		cacheURL(repoURL, resolvedURL)
+		// urljoin 语义：以 manifest/默认远程 URL 为基准规范化 "." 与 ".." 段，
+		// 与上游 manifest 的 fetch URL 解析一致（如 ../repo.git 相对 base 的目录）。
+		// 无法解析时 ResolveRelativeURL 原样返回相对路径，不会生成 "/foo" 伪绝对路径。
+		resolvedURL := cfg.ResolveRelativeURL(repoURL)
+		if resolvedURL == "" {
+			resolvedURL = repoURL
+		}
 
+		cacheURL(cacheKey, resolvedURL)
 		return resolvedURL, nil
+	}
+
+	// Check cache（绝对 URL 与 base URL 无关）
+	if cachedURL, ok := getCachedURL(repoURL); ok {
+		return cachedURL, nil
 	}
 
 	// Handle URL format
@@ -470,23 +580,23 @@ func (r *Repository) DeleteBranch(branch string, force bool) error {
 		args = append(args, "-d")
 	}
 
-	args = append(args, branch)
+	// -- 分隔，避免分支名以 - 开头被当作选项
+	args = append(args, "--", branch)
 
 	_, err := r.Runner.RunInDir(r.Path, args...)
 	if err != nil {
 		return fmt.Errorf("failed to delete branch: %w", err)
 	}
 
+	r.ClearCache()
 	return nil
 }
 
 // CreateBranch 创建新分
 func (r *Repository) CreateBranch(branch string, startPoint string) error {
-	args := []string{"branch"}
+	args := []string{"branch", "--", branch}
 	if startPoint != "" {
-		args = append(args, branch, startPoint)
-	} else {
-		args = append(args, branch)
+		args = append(args, startPoint)
 	}
 
 	_, err := r.Runner.RunInDir(r.Path, args...)
@@ -494,6 +604,7 @@ func (r *Repository) CreateBranch(branch string, startPoint string) error {
 		return fmt.Errorf("failed to create branch: %w", err)
 	}
 
+	r.ClearCache()
 	return nil
 }
 
@@ -506,12 +617,13 @@ func (r *Repository) HasChangesToPush(remote string) (bool, error) {
 		return false, fmt.Errorf("failed to get current branch: %w", err)
 	}
 
-	// 如果当前是 detached HEAD 状态，返回 false
-	if currentBranch == "HEAD" {
+	// 如果当前是 detached HEAD 状态，返回 false。
+	// CurrentBranch 在分离头指针时返回 "HEAD detached at <sha>"，不能与 "HEAD" 比较。
+	if strings.HasPrefix(currentBranch, "HEAD detached") {
 		return false, nil
 	}
 
-	// 构造远程分支名称
+	// 构造远程分支名称（使用短分支名，如 origin/main）
 	remoteBranch := remote + "/" + currentBranch
 
 	// 检查远程分支是否存在（--quiet：不存在时静默，避免 stderr 噪音）
@@ -532,16 +644,11 @@ func (r *Repository) HasChangesToPush(remote string) (bool, error) {
 	return count != "0" && count != "", nil
 }
 
-// GetBranchName 获取当前分支名称
+// GetBranchName 获取当前分支名称。
+// 复用 CurrentBranch 的完整 symbolic-ref 解析，避免同名 tag 下的歧义短名，
+// 分离头指针时返回与 CurrentBranch 一致的 sentinel。
 func (r *Repository) GetBranchName() (string, error) {
-	// 使用 Runner 而不runner
-	// 使用 Path 而不path
-	output, err := r.Runner.RunInDir(r.Path, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("failed to get current branch: %w", err)
-	}
-
-	return strings.TrimSpace(string(output)), nil
+	return r.CurrentBranch()
 }
 
 // ListRemotes 列出所有远程仓库

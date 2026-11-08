@@ -144,9 +144,12 @@ func TestIncludeRemoveProjectTargetsOuterProject(t *testing.T) {
 	}
 }
 
-// TestNestedProjectFlattening 嵌套 <project>（上游 Git submodule 表达法）展平：
-// 子项目 name = 父name/子name；显式 path 相对父路径展开；缺省 path 为
-// 父path/父name/子name（上游 GetSubprojectPaths 规则）。
+// TestNestedProjectFlattening 嵌套 <project>（上游 Git submodule 表达法）展平。
+// 路径规则以上游实测为准（manifest_xml.py _ParseProject + GetSubprojectPaths）：
+//   - 子项目 name = 父name/子name（_JoinName）；
+//   - 显式 path：父项目路径 + 显式 path（_JoinRelpath）；
+//   - 缺省 path：父项目路径 + 拼接后的 name（path = name 后再 _JoinRelpath），
+//     因此深层缺省路径会出现重复的父段，这是上游真实语义而非重复拼接 bug。
 func TestNestedProjectFlattening(t *testing.T) {
 	xml := `<?xml version="1.0" encoding="UTF-8"?>
 <manifest>
@@ -168,7 +171,7 @@ func TestNestedProjectFlattening(t *testing.T) {
 	want := []struct{ name, path string }{
 		{"parent", "plat/parent"},
 		{"parent/child1", "plat/parent/sub"},           // 显式 path 相对父展开
-		{"parent/child2", "plat/parent/parent/child2"}, // 缺省 path：父path/父name/子name
+		{"parent/child2", "plat/parent/parent/child2"}, // 缺省 path = 父path + 拼接 name
 		{"top", "top"},
 	}
 	if len(m.Projects) != len(want) {

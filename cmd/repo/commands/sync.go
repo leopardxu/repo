@@ -64,8 +64,7 @@ type SyncOptions struct {
 // SyncCmd 返回sync命令
 func SyncCmd() *cobra.Command {
 	opts := &SyncOptions{
-		Jobs:         runtime.NumCPU() * 2,
-		RetryFetches: 3,
+		Jobs: runtime.NumCPU() * 2,
 	}
 
 	cmd := &cobra.Command{
@@ -157,8 +156,25 @@ func registerSyncFlags(cmd *cobra.Command, opts *SyncOptions, includeSmartSyncFl
 	cmd.Flags().BoolVar(&opts.Dissociate, "dissociate", false, "dissociate from reference mirrors after clone")
 }
 
+// validateSyncOptions 校验互斥选项，避免 -n/-l、-n/-d 组合静默变成空操作。
+// 错误文本对齐上游 repo 的 ValidateOptions。
+func validateSyncOptions(opts *SyncOptions) error {
+	if opts.NetworkOnly && opts.Detach {
+		return fmt.Errorf("cannot combine -n and -d")
+	}
+	if opts.NetworkOnly && opts.LocalOnly {
+		return fmt.Errorf("cannot combine -n and -l")
+	}
+	return nil
+}
+
 // runSync 执行sync命令
 func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Command) error {
+	if err := validateSyncOptions(opts); err != nil {
+		log.Error("参数组合无效: %v", err)
+		return err
+	}
+
 	// 确保在repo根目录下执行
 	originalDir, err := EnsureRepoRoot(log)
 	if err != nil {
@@ -186,12 +202,17 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		return fmt.Errorf("manifest.xml文件不存在，请先运行 'repo init' 命令")
 	}
 
-	// 如果命令行没有指定groups 参数，则从配置文件中读取
-	if opts.Groups == "" && cfg.Groups != "" {
-		log.Debug("从配置文件中读取组信息 %s", cfg.Groups)
-		opts.Groups = cfg.Groups
-		log.Debug("使用配置文件中的组信息 %s", cfg.Groups)
+	// 组过滤：命令行显式给出 --groups（Changed）或调用方已设置非空组时以其为准
+	// （显式空串表示取消配置里的组过滤）；否则使用 config.EffectiveGroups()
+	// （配置组非空返回原值，空则回退 "default"，对齐上游默认组语义）。
+	effectiveGroups := opts.Groups
+	if effectiveGroups == "" && !cmd.Flags().Changed("groups") {
+		effectiveGroups = cfg.EffectiveGroups()
+		if effectiveGroups != "" {
+			log.Debug("使用有效组信息 %s", effectiveGroups)
+		}
 	}
+	opts.Groups = effectiveGroups
 
 	// 首先更新 manifest 仓库（--local-only 跳过所有网络操作，含 manifest 仓库更新）
 	if !opts.NoManifestUpdate && !opts.LocalOnly {
@@ -205,11 +226,12 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		}, nil, log)
 
 		if err := tempEngine.UpdateManifestRepo(); err != nil {
-			log.Warn("更新 manifest 仓库failed: %v", err)
-			// 不返回错误，继续执行同步
-		} else {
-			log.Info("manifest 仓库更新完成")
+			// 对齐上游：manifest 仓库更新失败是致命错误，不能带着可能不一致的
+			// 清单继续同步。
+			log.Error("更新 manifest 仓库failed: %v", err)
+			return fmt.Errorf("failed to update manifest repository: %w", err)
 		}
+		log.Info("manifest 仓库更新完成")
 	}
 
 	// 加载合并后的清单文件(.repo/manifest.xml)，不使用原始仓库列表
@@ -221,6 +243,9 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		groupsSlice = manifest.SplitGroups(opts.Groups)
 		log.Info("根据以下组过滤清单: %v", groupsSlice)
 	} else {
+		// 显式 -g ""：取消组过滤。用非 nil 空切片与“未给出组”区分，
+		// 避免引擎再次回退到 config.EffectiveGroups()。
+		groupsSlice = []string{}
 		log.Info("未指定组过滤，将加载所有项目")
 	}
 
@@ -231,6 +256,14 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		return fmt.Errorf("failed to parse manifest: %w", err)
 	}
 	log.Debug("成功加载清单，包含 %d 个项目", len(manifestObj.Projects))
+
+	// <notice> 是结果 payload：成功或失败都按原样写 stdout，不受 -q 影响。
+	if manifestObj.Notice != "" {
+		notice := manifestObj.Notice
+		defer func() {
+			fmt.Fprintln(os.Stdout, notice)
+		}()
+	}
 
 	// 并发数优先级：命令行 -j > manifest default sync-j > 配置文件 > 内置默认值
 	// 仅当用户未显式指定 -j 时应用 manifest/config 默认值（用 Changed 判定，避免哨兵值比较的脆弱性）。
@@ -252,7 +285,7 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 	}
 
 	// manifest default sync-c：仅当用户未显式指定 -c/--no-current-branch 时生效
-	if manifestObj.Default.SyncC && !cmd.Flags().Changed("current-branch") && !cmd.Flags().Changed("no-current-branch") {
+	if manifestObj.Default.SyncC.Get(false) && !cmd.Flags().Changed("current-branch") && !cmd.Flags().Changed("no-current-branch") {
 		log.Debug("使用manifest default sync-c: true")
 		opts.CurrentBranch = true
 	}
@@ -271,12 +304,13 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		log.Debug("获取所有项目（清单解析阶段已按组过滤）")
 		projects = manager.GetProjects()
 	} else {
-		// 否则，只处理指定的项目
-		log.Debug("根据名称failed to get project: %v", args)
-		projects, err = manager.GetProjectsByNames(args)
+		// 支持项目名、相对/绝对路径与 "."（对齐上游 command.py GetProjects）。
+		// 基准目录使用 chdir 前的原始目录，路径参数不会因 EnsureRepoRoot 而错位。
+		log.Debug("根据名称/路径解析项目: %v", args)
+		projects, err = manager.GetProjectsByArgs(args, originalDir)
 		if err != nil {
-			log.Error("根据名称failed to get projectfailed: %v", err)
-			return fmt.Errorf("根据名称failed to get projectfailed: %w", err)
+			log.Error("根据名称/路径解析项目failed: %v", err)
+			return fmt.Errorf("failed to resolve projects: %w", err)
 		}
 		log.Debug("共获取到 %d 个项目", len(projects))
 	}
@@ -302,11 +336,22 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		log.Info("未指定组过滤，将同步所有项目")
 	}
 
+	// 超级项目：显式 --use-superproject 或配置启用（--no-use-superproject 优先禁用）。
+	// 显式 --use-superproject 隐含 --current-branch（对齐上游 sync 语义）。
+	useSuperproject := !opts.NoUseSuperproject &&
+		(opts.UseSuperproject || cfg.IsSuperprojectEnabled())
+	currentBranch := opts.CurrentBranch && !opts.NoCurrentBranch
+	// 超级项目（显式或配置启用）隐含 --current-branch，对齐上游
+	// _GetCurrentBranchOnly；仍尊重显式 --no-current-branch。
+	if useSuperproject && !opts.NoCurrentBranch {
+		currentBranch = true
+	}
+
 	engine := repo_sync.NewEngine(&repo_sync.Options{
 		Jobs:                   opts.Jobs,
 		JobsNetwork:            opts.JobsNetwork,
 		JobsCheckout:           opts.JobsCheckout,
-		CurrentBranch:          opts.CurrentBranch && !opts.NoCurrentBranch,
+		CurrentBranch:          currentBranch,
 		Detach:                 opts.Detach,
 		ForceSync:              opts.ForceSync,
 		ForceRemoveDirty:       opts.ForceRemoveDirty,
@@ -323,6 +368,7 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		FetchSubmodules:        opts.FetchSubmodules || cfg.Submodules, // 命令行参数或配置文件
 		OptimizedFetch:         opts.OptimizedFetch,
 		RetryFetches:           opts.RetryFetches,
+		NoCloneBundle:          opts.NoCloneBundle,
 		Groups:                 groupsSlice, // 传递已处理的分组信息，确保只克隆指定组的仓
 		FailFast:               opts.FailFast,
 		NoManifestUpdate:       opts.NoManifestUpdate,
@@ -330,7 +376,7 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		ManifestServerPassword: opts.ManifestServerPassword,
 		ManifestServerURL:      opts.ManifestServerURL,
 		NoManifestServer:       opts.NoManifestServer,
-		UseSuperproject:        opts.UseSuperproject && !opts.NoUseSuperproject,
+		UseSuperproject:        useSuperproject,
 		HyperSync:              opts.HyperSync,
 		SmartTag:               opts.SmartTag,
 		AutoGC:                 opts.AutoGC && !opts.NoAutoGC,
@@ -343,6 +389,17 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 
 	// 设置要同步的项目
 	engine.SetProjects(projects)
+	// 仅命令行显式给出项目参数时才记录子集；无参数时 smart-sync 重载清单
+	// 后必须保留全部已审批项目（新项目不能被旧名称集合过滤掉）。
+	if len(args) > 0 {
+		names := make([]string, 0, len(projects))
+		for _, p := range projects {
+			if p != nil {
+				names = append(names, p.Name)
+			}
+		}
+		engine.SetProjectSubset(names)
+	}
 
 	// 执行同步
 	log.Info("开始同步项目，并行任务 %d...", opts.Jobs)
@@ -356,9 +413,5 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 
 	log.Info("同步操作成功完成，共同步 %d 个项目", len(projects))
 
-	// 对齐上游 repo sync：完成后打印清单 notice（含 include 清单合并的 notice）
-	if manifestObj.Notice != "" {
-		log.Info("\n%s", manifestObj.Notice)
-	}
 	return nil
 }

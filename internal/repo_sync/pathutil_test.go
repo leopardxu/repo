@@ -22,6 +22,9 @@ func TestIsSafeToDelete(t *testing.T) {
 		{"safe path", filepath.Join(cwd, "test_dir"), repoRoot, false},
 		{"unsafe parent", filepath.Dir(cwd), repoRoot, true},
 		{"unsafe outside repo", filepath.Join(filepath.Dir(cwd), "other"), repoRoot, true},
+		{"repo root itself", repoRoot, repoRoot, true},
+		{"empty repo root", filepath.Join(cwd, "test_dir"), "", true},
+		{"sibling prefix dir", cwd + "-sibling", repoRoot, true},
 	}
 
 	for _, tt := range tests {

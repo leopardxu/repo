@@ -4,7 +4,31 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/leopardxu/repo-go/internal/manifest"
 )
+
+// resolveRepoMetadataDir 返回 .repo 元数据目录的路径。
+// RepoDir 为相对路径时以 Topdir 为基准，确保输出始终落在仓库根的 .repo 下，
+// 而不是当前工作目录（CLI 之外调用时 cwd 未必是仓库根）。
+func resolveRepoMetadataDir(m *manifest.Manifest) string {
+	if m == nil {
+		return ".repo"
+	}
+	if m.RepoDir != "" {
+		if filepath.IsAbs(m.RepoDir) {
+			return m.RepoDir
+		}
+		if m.Topdir != "" {
+			return filepath.Join(m.Topdir, m.RepoDir)
+		}
+		return m.RepoDir
+	}
+	if m.Topdir != "" {
+		return filepath.Join(m.Topdir, ".repo")
+	}
+	return ".repo"
+}
 
 // IsSafeToDelete 检查路径是否可以安全删除
 // 返回 nil 表示安全，返回 error 表示不安全，包含原因
@@ -12,11 +36,18 @@ func IsSafeToDelete(worktreePath string, repoRoot string) error {
 	if worktreePath == "" {
 		return fmt.Errorf("working directory路径为空")
 	}
+	if repoRoot == "" {
+		return fmt.Errorf("repo 根目录为空，无法校验删除范围，deletion refused")
+	}
 
 	// 获取绝对路径
 	absWorktree, err := filepath.Abs(worktreePath)
 	if err != nil {
 		return fmt.Errorf("无法获取working directory绝对路径: %w", err)
+	}
+	absRepoRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return fmt.Errorf("无法获取 repo 根目录绝对路径: %w", err)
 	}
 
 	// 检查是否为危险路径
@@ -24,19 +55,19 @@ func IsSafeToDelete(worktreePath string, repoRoot string) error {
 		return fmt.Errorf("working directory %s is a system critical directory, deletion is forbidden", worktreePath)
 	}
 
-	// 如果 repoRoot 不为空，检查路径是否在允许范围内
-	if repoRoot != "" {
-		absRepoRoot, err := filepath.Abs(repoRoot)
-		if err != nil {
-			return fmt.Errorf("无法获取 repo 根目录绝对路径: %w", err)
-		}
+	// 目标就是 repo 根目录本身：删除它会销毁整个客户端，必须拒绝
+	if absWorktree == absRepoRoot {
+		return fmt.Errorf("working directory %s 是 repo 根目录本身，deletion refused", worktreePath)
+	}
 
-		// 检查是否在 repoRoot 下
-		inRepoDir := strings.HasPrefix(absWorktree, absRepoRoot+string(filepath.Separator)) ||
-			absWorktree == absRepoRoot
-		if !inRepoDir {
-			return fmt.Errorf("working directory %s 不在 repo 根目录 %s 下，deletion refused", worktreePath, repoRoot)
-		}
+	// 使用 filepath.Rel 做分隔符感知的包含判断，避免 HasPrefix 把
+	// /repo 与 /repo-sibling 这类兄弟目录误判为位于 repo 根目录下。
+	rel, err := filepath.Rel(absRepoRoot, absWorktree)
+	if err != nil {
+		return fmt.Errorf("无法计算 working directory 与 repo 根目录的相对路径: %w", err)
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("working directory %s 不在 repo 根目录 %s 下，deletion refused", worktreePath, repoRoot)
 	}
 
 	return nil

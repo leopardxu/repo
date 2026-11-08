@@ -57,6 +57,7 @@ func InfoCmd() *cobra.Command {
 	cmd.Flags().IntVarP(&opts.Jobs, "jobs", "j", min(runtime.NumCPU(), 8), "number of jobs to run in parallel")
 	cmd.Flags().BoolVarP(&opts.Verbose, "verbose", "v", false, "show all output")
 	cmd.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "only show errors")
+	cmd.Flags().StringVarP(&opts.Groups, "groups", "g", "", "restrict execution to projects in specified groups (comma-separated)")
 	AddManifestFlags(cmd, &opts.CommonManifestOptions)
 	return cmd
 }
@@ -101,10 +102,10 @@ func runInfo(opts *InfoOptions, args []string) error {
 	}
 	opts.Config = cfg // 分配加载的配置
 
-	// 加载manifest
+	// 加载manifest（显式 --groups 优先，否则 cfg.Groups；只解析一次）
 	log.Debug("Loading manifest from %s", cfg.ManifestName)
 	parser := manifest.NewParser()
-	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.Groups)) // 重用err
+	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, readCmdEffectiveGroups(opts.Groups, cfg))
 	if err != nil {
 		log.Error("Failed to parse manifest: %v", err)
 		return err
@@ -113,33 +114,27 @@ func runInfo(opts *InfoOptions, args []string) error {
 	// 创建项目管理器
 	manager := project.NewManagerFromManifest(manifestObj, cfg)
 
-	// 声明projects变量
+	// 获取要操作的项目（位置参数走上游名字+路径回溯语义；无参 = 全部）
 	var projects []*project.Project
-
-	// 获取要操作的项目
 	if len(args) == 0 {
 		log.Debug("Getting all projects")
-		projects, err = manager.GetProjectsInGroups(nil) // 使用=，使用nil
-		if err != nil {
-			log.Error("Failed to get projects: %v", err)
-			return err
-		}
+		projects, err = manager.GetProjectsInGroups(nil)
 	} else {
-		log.Debug("Getting projects by names: %v", args)
-		projects, err = manager.GetProjectsByNames(args) // 使用=
-		if err != nil {
-			log.Error("Failed to get projects by name: %v", err)
-			return err
-		}
+		log.Debug("Resolving projects by args: %v", args)
+		projects, err = manager.GetProjectsByArgs(args, originalDir)
+	}
+	if err != nil {
+		log.Error("Failed to get projects: %v", err)
+		return err
 	}
 
 	log.Debug("Found %d projects to process", len(projects))
 
 	// -c/--current-branch（默认）：仅显示当前分支（默认模式）或仅当前分支提交（-o）
 	// --no-current-branch：列出所有本地分支（默认模式）或考虑所有本地分支提交（-o --all）
-	// --local-only：禁用远程操作（不解析 @{upstream}）
+	// --local-only：禁用远程操作（diff 使用已有远端引用，不访问网络）
 	if opts.LocalOnly {
-		log.Debug("--local-only：禁用远程操作")
+		log.Debug("--local-only：禁用远程操作（使用已有远端引用）")
 	}
 	if opts.NoCurrentBranch {
 		log.Debug("--no-current-branch：考虑所有本地分支")
@@ -160,6 +155,7 @@ func runInfo(opts *InfoOptions, args []string) error {
 	type infoResult struct {
 		Project *project.Project
 		Output  string
+		Missing bool
 		Err     error
 	}
 
@@ -187,21 +183,39 @@ func runInfo(opts *InfoOptions, args []string) error {
 
 			log.Debug("Processing project %s", proj.Name)
 
+			// 未初始化项目跳过（不视为失败）；镜像项目按裸库目录判定，
+			// 便于展示 Relpath 而非绝对 .git 路径。
+			if !readCmdProjectExists(proj) || proj.GitRepo == nil {
+				results <- infoResult{Project: proj, Missing: true}
+				return
+			}
+
 			// 根据选项显示不同信息
 			// -c/--current-branch 影响：默认模式仅显示当前分支、-o 模式仅当前分支提交；
 			// --no-current-branch 则列出所有本地分支 / 给 log 追加 --all。
-			// --local-only 禁用远程操作（diff 模式下不解析 @{upstream}）
+			// --local-only 禁用远程操作（diff 模式下不访问网络，只使用已有远端引用）
 			switch {
 			case opts.Diff:
 				log.Debug("Getting diff for project %s", proj.Name)
-				// --local-only 时仅显示 HEAD 提交，不与 @{upstream} 比较
-				if opts.LocalOnly {
-					outputBytes, err = proj.GitRepo.RunCommand("log", "--oneline", "-10")
-				} else {
-					outputBytes, err = proj.GitRepo.RunCommand("log", "--oneline", "HEAD..@{upstream}")
+				// 默认比较目标顺序：项目 revision（SHA/tag/本地分支）→
+				// refs/remotes/<remote>/<revision> → cfg.ManifestBranch 远端引用。
+				// --local-only 时只使用仓库已有引用，不访问网络（不刷新远端）。
+				target, terr := infoResolveDiffTarget(proj, cfg)
+				if terr != nil {
+					// detached HEAD / 无远端跟踪引用：明确标注无法比较远端，不伪造本地提交
+					log.Warn("项目 %s 无法比较远端: %v", proj.Name, terr)
+					output = infoDiffUnavailable(terr.Error())
+					break
 				}
+				outputBytes, err = proj.GitRepo.RunCommand(infoDiffArgs(target)...)
 				if err == nil {
-					output = strings.TrimSpace(string(outputBytes))
+					local, remote := infoSplitDiffCommits(string(outputBytes))
+					output = infoFormatDiff(local, remote)
+				} else {
+					// HEAD 无效（如空仓库）时同样标注无法比较远端，不使整命令失败
+					log.Warn("项目 %s 无法比较远端 %s: %v", proj.Name, target, err)
+					output = infoDiffUnavailable(err.Error())
+					err = nil
 				}
 			case opts.Overview:
 				log.Debug("Getting overview for project %s", proj.Name)
@@ -224,7 +238,7 @@ func runInfo(opts *InfoOptions, args []string) error {
 				}
 				var sb strings.Builder
 				fmt.Fprintf(&sb, "Project: %s\n", proj.Name)
-				fmt.Fprintf(&sb, "Path: %s\n", proj.Path)
+				fmt.Fprintf(&sb, "Path: %s\n", readCmdProjectRelpath(proj))
 				fmt.Fprintf(&sb, "Remote name: %s\n", remoteName)
 				fmt.Fprintf(&sb, "Manifest revision: %s\n", proj.Revision)
 				if opts.NoCurrentBranch {
@@ -255,6 +269,10 @@ func runInfo(opts *InfoOptions, args []string) error {
 
 	// 收集并显示结果
 	for res := range results {
+		if res.Missing {
+			log.Debug("跳过未检出项目 %s (missing)", res.Project.Name)
+			continue
+		}
 		if res.Err != nil {
 			stats.mu.Lock()
 			stats.failed++
@@ -269,9 +287,11 @@ func runInfo(opts *InfoOptions, args []string) error {
 		stats.mu.Unlock()
 
 		if res.Output != "" {
-			log.Info("--- %s ---\n%s", res.Project.Name, res.Output)
-		} else if !opts.Quiet {
-			log.Info("--- %s ---\n(No changes)", res.Project.Name)
+			readCmdResultLine("--- %s ---", res.Project.Name)
+			readCmdResultLine("%s", res.Output)
+		} else {
+			readCmdResultLine("--- %s ---", res.Project.Name)
+			readCmdResultLine("(No changes)")
 		}
 	}
 
@@ -283,4 +303,135 @@ func runInfo(opts *InfoOptions, args []string) error {
 	}
 
 	return nil
+}
+
+// infoDiffArgs 构造 -d 的三点比较参数：HEAD...<target>（target 为
+// refs/remotes/... 远端引用）。target 为空表示没有可比较的远端目标。
+// --left-right 用于区分本地独有（<）与远端独有（>）提交，对齐上游
+// info.py:_GetDiffCommits 的一次 history walk 语义。
+func infoDiffArgs(target string) []string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	return []string{"log", "--oneline", "--left-right", "HEAD..." + target, "--"}
+}
+
+// infoDiffTargetRef 构造远端跟踪引用 refs/remotes/<remote>/<branch>。
+// remote 为空时回退 origin；branch 为空时返回空串；refs/heads/ 前缀会被
+// 去掉（对齐上游 manifest merge 分支处理），其它完整引用原样返回。
+func infoDiffTargetRef(remoteName, branch string) string {
+	branch = strings.TrimSpace(branch)
+	branch = strings.TrimPrefix(branch, "refs/heads/")
+	if branch == "" {
+		return ""
+	}
+	if strings.HasPrefix(branch, "refs/") {
+		return branch
+	}
+	remote := strings.TrimSpace(remoteName)
+	if remote == "" {
+		remote = "origin"
+	}
+	return "refs/remotes/" + remote + "/" + branch
+}
+
+// infoDiffTargetCandidates 返回 -d 的比较目标尝试顺序（对齐本次审计要求）：
+//  1. SHA/refs/tags 等不可变 revision 直接使用；
+//  2. 分支名与 refs/heads/X 先 refs/remotes/<remote>/X，再回退 refs/heads/X；
+//  3. 最后回退清单分支 cfg.ManifestBranch 的远端跟踪引用。
+//
+// 裸 revision 只按分支名处理（tag 仅支持显式 refs/tags/ 前缀），本地回退用
+// 完整 refs/heads/ 形式，避免 git 的 DWIM 把同名 tag 解析出来。三者按顺序
+// 去重后返回。注意这里只构造候选，是否可用由调用方 rev-parse 验证。
+func infoDiffTargetCandidates(remoteName, manifestBranch, revision string) []string {
+	candidates := make([]string, 0, 4)
+	seen := make(map[string]bool, 4)
+	appendCandidate := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if ref == "" || seen[ref] {
+			return
+		}
+		seen[ref] = true
+		candidates = append(candidates, ref)
+	}
+	for _, ref := range readCmdRevisionCandidates(revision, remoteName, true) {
+		appendCandidate(ref)
+	}
+	appendCandidate(infoDiffTargetRef(remoteName, manifestBranch))
+	return candidates
+}
+
+// infoResolveDiffTarget 按候选顺序解析项目可用的比较目标：优先不可变 revision
+// （SHA/显式 refs/tags），其次 refs/remotes/<remote>/<revision> 跟踪引用，
+// 再回退 refs/heads/<revision>，最后回退 cfg.ManifestBranch。全部不可用时
+// 返回错误（调用方据此标注"无法比较远端"）。--local-only 时调用方不刷新远端，
+// 因此这里只读取仓库已有引用，绝不访问网络。
+func infoResolveDiffTarget(proj *project.Project, cfg *config.Config) (string, error) {
+	if proj == nil || proj.GitRepo == nil {
+		return "", fmt.Errorf("项目未检出，无法解析比较目标")
+	}
+	manifestBranch := ""
+	if cfg != nil {
+		manifestBranch = cfg.ManifestBranch
+	}
+	candidates := infoDiffTargetCandidates(proj.RemoteName, manifestBranch, proj.Revision)
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("项目 %s 没有可用的 revision 或远端分支", proj.Name)
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		if _, err := proj.GitRepo.RunCommand("rev-parse", "--verify", candidate+"^{commit}"); err != nil {
+			lastErr = err
+			continue
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("无法解析比较目标 %s: %w", strings.Join(candidates, ", "), lastErr)
+}
+
+// infoDiffUnavailable 生成无法比较远端时的输出（不伪造本地提交）。
+func infoDiffUnavailable(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "无法解析远端比较目标"
+	}
+	return "无法比较远端: " + reason
+}
+
+// infoSplitDiffCommits 把 --left-right 的 git log 输出拆成 local/remote 两组提交。
+func infoSplitDiffCommits(output string) (local []string, remote []string) {
+	local = make([]string, 0)
+	remote = make([]string, 0)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case strings.HasPrefix(line, "<"):
+			if c := strings.TrimSpace(line[1:]); c != "" {
+				local = append(local, c)
+			}
+		case strings.HasPrefix(line, ">"):
+			if c := strings.TrimSpace(line[1:]); c != "" {
+				remote = append(remote, c)
+			}
+		}
+	}
+	return local, remote
+}
+
+// infoFormatDiff 生成 -d 的 Local Commits / Remote Commits 两段输出。
+func infoFormatDiff(local, remote []string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Local Commits: %d (on current branch)\n", len(local))
+	for _, c := range local {
+		sb.WriteString(c)
+		sb.WriteByte('\n')
+	}
+	sb.WriteString("----------------------------\n")
+	fmt.Fprintf(&sb, "Remote Commits: %d\n", len(remote))
+	for _, c := range remote {
+		sb.WriteString(c)
+		sb.WriteByte('\n')
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }

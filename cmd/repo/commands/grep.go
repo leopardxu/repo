@@ -130,10 +130,10 @@ func runGrep(opts *GrepOptions, projectNames []string) error {
 		}
 	}()
 
-	// 加载清单
+	// 加载清单（显式 --groups 优先，否则 cfg.Groups；只解析一次）
 	log.Debug("正在加载清单文件...")
 	parser := manifest.NewParser()
-	manifestObj, err := parser.ParseFromFile(opts.Config.ManifestName, manifest.SplitGroups(opts.Config.Groups))
+	manifestObj, err := parser.ParseFromFile(opts.Config.ManifestName, readCmdEffectiveGroups(opts.Groups, opts.Config))
 	if err != nil {
 		log.Error("failed to parse manifest file: %v", err)
 		return fmt.Errorf("failed to parse manifest: %w", err)
@@ -143,38 +143,18 @@ func runGrep(opts *GrepOptions, projectNames []string) error {
 	log.Debug("正在创建项目管理器...")
 	manager := project.NewManagerFromManifest(manifestObj, opts.Config)
 
-	// 获取要处理的项目
+	// 获取要处理的项目（位置参数走上游名字+路径回溯语义；无参 = 全部）
 	log.Debug("正在获取要处理的项目...")
 	var projects []*project.Project
-	var groupsArg []string
-	if opts.Groups != "" {
-		groupsArg = manifest.SplitGroups(opts.Groups)
-	}
-
 	if len(projectNames) == 0 {
-		log.Debug("获取所有项目...")
-		projects, err = manager.GetProjectsInGroups(groupsArg)
-		if err != nil {
-			log.Error("failed to get projectfailed: %v", err)
-			return fmt.Errorf("failed to get projects: %w", err)
-		}
+		projects, err = manager.GetProjectsInGroups(nil)
 	} else {
-		log.Debug("根据名称failed to get project: %v", projectNames)
-		// 过滤指定的项目
-		filteredProjects, err := manager.GetProjectsByNames(projectNames)
-		if err != nil {
-			log.Error("根据名称failed to get projectfailed: %v", err)
-			return fmt.Errorf("failed to get projects by name: %w", err)
-		}
-		if len(groupsArg) > 0 {
-			for _, p := range filteredProjects {
-				if p.IsInAnyGroup(groupsArg) {
-					projects = append(projects, p)
-				}
-			}
-		} else {
-			projects = filteredProjects
-		}
+		log.Debug("解析项目参数: %v", projectNames)
+		projects, err = manager.GetProjectsByArgs(projectNames, originalDir)
+	}
+	if err != nil {
+		log.Error("failed to get projectfailed: %v", err)
+		return fmt.Errorf("failed to get projects: %w", err)
 	}
 
 	// 构建 git grep 参数
@@ -260,8 +240,9 @@ func runGrep(opts *GrepOptions, projectNames []string) error {
 	validProjects := 0
 
 	for _, p := range projects {
-		if p.Worktree == "" {
-			log.Debug("跳过项目 %s (无working directory)", p.Name)
+		// 未检出项目跳过（不视为失败）
+		if readCmdProjectMissing(p) {
+			log.Debug("跳过未检出项目 %s (missing)", p.Name)
 			continue
 		}
 

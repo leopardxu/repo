@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,12 +24,20 @@ import (
 // 防止异常响应（如被重定向到超大文件）写满磁盘。
 const maxBinarySize int64 = 256 << 20
 
+// maxUpdateRedirects 限制自更新下载的重定向跳数（与 net/http 默认值一致）。
+const maxUpdateRedirects = 10
+
+// errChecksumNotFound 表示远端没有 <url>.sha256 校验文件（HTTP 404/410）。
+// 此时按上游语义允许无校验和继续下载；其他获取失败视为错误。
+var errChecksumNotFound = errors.New("sha256 校验文件不存在")
+
 // SelfUpdateOptions 包含 selfupdate 命令的选项
 type SelfUpdateOptions struct {
-	URL      string
-	Checksum string
-	Check    bool
-	Quiet    bool
+	URL         string
+	Checksum    string
+	Check       bool
+	Quiet       bool
+	checksumSet bool // --checksum 是否显式提供（空值也必须视为非法）
 }
 
 // SelfUpdateCmd 返回 selfupdate 命令
@@ -45,11 +54,13 @@ repo-go is distributed as a compiled binary; selfupdate downloads a new binary
 from the given URL (or the REPO_SELFUPDATE_URL environment variable) and
 atomically replaces the current executable. Without a URL it prints the current
 version and update guidance. Use "repo version" to see the current version.`,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			log := logger.NewDefaultLogger()
 			if opts.Quiet {
 				log.SetLevel(logger.LogLevelError)
 			}
+			// 记录 --checksum 是否显式提供：显式空值同样非法，不能退化为"未提供"。
+			opts.checksumSet = cmd.Flags().Changed("checksum")
 			return runSelfUpdate(opts, info, log)
 		},
 	}
@@ -87,9 +98,12 @@ func validateUpdateURL(raw string) error {
 
 // newSelfUpdateHTTPClient 创建带超时与合理连接池参数的 HTTP 客户端。
 // 默认 http.Get/Head 的 client 无超时，服务器无响应时 selfupdate 会永久挂起。
+// CheckRedirect 对每一跳重新校验地址，禁止 https 降级到明文 HTTP（或跳到
+// 公网 http 攻击者 host）；Go 默认只限制跳数，不校验协议。
 func newSelfUpdateHTTPClient() *http.Client {
 	return &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout:       60 * time.Second,
+		CheckRedirect: checkUpdateRedirect,
 		Transport: &http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
 			MaxIdleConns:        10,
@@ -98,6 +112,23 @@ func newSelfUpdateHTTPClient() *http.Client {
 			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 		},
 	}
+}
+
+// checkUpdateRedirect 校验每一跳重定向目标：
+//   - 跳数不得超过 maxUpdateRedirects；
+//   - 目标地址必须通过 validateUpdateURL（仅 https，或 loopback http）；
+//   - 初始为 https 时禁止降级为任何 http（含 loopback）。
+func checkUpdateRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxUpdateRedirects {
+		return fmt.Errorf("更新下载重定向次数过多（超过 %d 次）", maxUpdateRedirects)
+	}
+	if err := validateUpdateURL(req.URL.String()); err != nil {
+		return fmt.Errorf("拒绝不安全的重定向目标 %s: %w", req.URL.Redacted(), err)
+	}
+	if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("拒绝从 https 降级到 %s 的重定向: %s", req.URL.Scheme, req.URL.Redacted())
+	}
+	return nil
 }
 
 // normalizeChecksum 归一化 sha256 校验和：去首尾空白、转小写，并校验为
@@ -131,14 +162,19 @@ func parseChecksumFile(data []byte) (string, error) {
 }
 
 // fetchRemoteChecksum 通过 GET shaURL 获取远端 sha256 校验和并归一化。
-// 仅在 HTTP 200 且响应体可解析时返回校验和；其余情况（404、网络错误、
-// 非法内容）一律返回错误，绝不伪造"校验通过"。
+// 仅在 HTTP 200 且响应体可解析时返回校验和；404/410 返回包装
+// errChecksumNotFound 的错误（调用方据此判定"远端未提供校验文件"），
+// 其余情况（网络错误、500、非法内容）一律返回普通错误，绝不伪造"校验通过"。
 func fetchRemoteChecksum(client *http.Client, shaURL string) (string, error) {
 	resp, err := client.Get(shaURL)
 	if err != nil {
 		return "", fmt.Errorf("获取sha256校验文件failed: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		// 不存在校验文件：调用方按"未提供校验和"处理（errChecksumNotFound）
+		return "", fmt.Errorf("%w: HTTP %d", errChecksumNotFound, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("获取sha256校验文件failed: HTTP %d", resp.StatusCode)
 	}
@@ -185,6 +221,19 @@ func runSelfUpdate(opts *SelfUpdateOptions, info VersionInfo, log logger.Logger)
 
 	client := newSelfUpdateHTTPClient()
 
+	// --checksum 显式提供时必须合法且必须校验（即使是 --check 模式也先校验参数）。
+	expected := ""
+	if opts.checksumSet || opts.Checksum != "" {
+		normalized, err := normalizeChecksum(opts.Checksum)
+		if err != nil {
+			return fmt.Errorf("--checksum 参数非法: %w", err)
+		}
+		if normalized == "" {
+			return fmt.Errorf("--checksum 参数非法: 校验和为空白")
+		}
+		expected = normalized
+	}
+
 	if opts.Check {
 		resp, err := client.Head(url)
 		if err != nil {
@@ -195,24 +244,20 @@ func runSelfUpdate(opts *SelfUpdateOptions, info VersionInfo, log logger.Logger)
 		return nil
 	}
 
-	// 确定期望校验和：--checksum 优先；未提供时尝试 GET <url>.sha256，
-	// 获取失败（404/网络/内容非法）仅告警并继续——绝不伪造校验通过。
-	expected := ""
-	if opts.Checksum != "" {
-		normalized, err := normalizeChecksum(opts.Checksum)
-		if err != nil {
-			return fmt.Errorf("--checksum 参数非法: %w", err)
-		}
-		expected = normalized
-	} else {
+	// 未显式提供校验和时尝试 GET <url>.sha256：仅 404/410 视为"不存在"
+	// 可继续，其他获取/解析失败一律拒绝更新——绝不伪造校验通过。
+	if expected == "" {
 		shaURL := url + ".sha256"
 		log.Debug("尝试获取校验和: %s", shaURL)
 		sum, err := fetchRemoteChecksum(client, shaURL)
-		if err != nil {
-			log.Warn("无法校验下载内容的完整性（%v），继续下载", err)
-		} else {
+		switch {
+		case err == nil:
 			expected = sum
 			log.Info("已获取 sha256 校验和: %s", sum)
+		case errors.Is(err, errChecksumNotFound):
+			log.Debug("未找到 %s，继续下载但不做校验和校验", shaURL)
+		default:
+			return fmt.Errorf("获取sha256校验文件failed，已放弃更新: %w", err)
 		}
 	}
 
@@ -251,10 +296,11 @@ func runSelfUpdate(opts *SelfUpdateOptions, info VersionInfo, log logger.Logger)
 	// 临时文件由 defer 清理，正式二进制不会被替换（不落盘）
 	actualSum, err := copyAndHash(tmp, resp.Body, maxBinarySize)
 	if err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
-	tmp.Close()
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭临时文件failed: %w", err)
+	}
 
 	if expected != "" && actualSum != expected {
 		return fmt.Errorf("sha256 校验失败：期望 %s，实际 %s，已放弃替换二进制", expected, actualSum)

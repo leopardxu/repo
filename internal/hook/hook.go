@@ -1,6 +1,7 @@
 package hook
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,18 +72,50 @@ fi
 
 APP_DIR=$(dirname "${APP_FULLPATH}")
 APP_NAME=$(basename "${APP_FULLPATH}")
-HOOK_DIR=$(readlink -f "${APP_DIR}/../cixtools/hooks")
+
+# 从 hook 所在位置向上查找包含 .repo 的 repo 顶层目录。
+# 优先从 git 工作树（hook 由 git 以工作树根为 cwd 调用）开始；
+# 工作树可能位于 repo 顶层之外，此时回退到 hook 文件自身所在目录。
+# hook 既可能是 .repo/hooks 下的符号链接，也可能被复制到
+# <项目>/.git/hooks 或镜像布局的 <项目>.git/hooks。
+find_repo_top() {
+    local dir="$1"
+    while [[ -n "${dir}" ]]; do
+        if [[ -d "${dir}/.repo" ]]; then
+            printf '%s' "${dir}"
+            return 0
+        fi
+        if [[ "${dir}" == "/" || "${dir}" == "." ]]; then
+            break
+        fi
+        dir=$(dirname "${dir}")
+    done
+    return 1
+}
+
+WORKTREE=$(git rev-parse --show-toplevel 2>/dev/null)
+REPO_TOP=""
+if [[ -n "${WORKTREE}" ]]; then
+    REPO_TOP=$(find_repo_top "${WORKTREE}")
+fi
+if [[ -z "${REPO_TOP}" ]]; then
+    REPO_TOP=$(find_repo_top "${APP_DIR}")
+fi
+
+if [[ -z "${REPO_TOP}" ]]; then
+    echo "No .repo directory found, ignore pre-commit check" >&2;
+    exit 0;
+fi
+
+HOOK_DIR=$(readlink -f "${REPO_TOP}/.repo/cixtools/hooks")
 if [[ ! -e "${HOOK_DIR}" ]]; then
     echo "No hook found, ignore pre-commit check" >&2;
     exit 0;
 fi
 
-WORKTREE=$(git rev-parse --show-toplevel)
-if [[ -z "${WORKTREE}" ]]; then
-    echo "Error: not a git repository, quit $WORKTREE" >&2;
-    exit 1;
-fi
-GIT_DIR=$(git rev-parse --git-dir)
+# WORKTREE 指向 repo 顶层，而不是当前项目工作树（hook 脚本的参数约定）。
+WORKTREE="${REPO_TOP}"
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
 if [[ -z "${GIT_DIR}" ]]; then
     echo "Error: not a git repository, quit $GIT_DIR" >&2;
     exit 1;
@@ -93,22 +126,36 @@ if [[ ! -e "${WORKTREE}/.cix-ciconfig" ]]; then
 fi
 
 set -e
-cat "${WORKTREE}/.cix-ciconfig" |
-grep '^pre-commit[[:space:]]*=' |
-sed -e 's#^pre-commit[[:space:]]*=[[:space:]]*##g'|
-while read script_name; do
-    if [[ -z $(echo "${script_name}"|grep '^["'\'']?/') ]]; then
-        echo eval "\"${HOOK_DIR}/\"${script_name} \"${WORKTREE}\" \"${GIT_DIR}\"" >&2;  # relative path to hooks/tools/
-        eval "\"${HOOK_DIR}/\"${script_name} \"${WORKTREE}\" \"${GIT_DIR}\"";  # relative path to hooks/tools/
-        if [[ $? -ne 0 ]]; then
-            exit $?;  # quit if any hook failed
-        fi
+# 先把配置读入数组，再在数组上循环：绝不能把循环放在 sed 管道的右侧，
+# 否则 hook 脚本读取 stdin 时会吞掉后续配置条目。这里用 while read + 进程替换
+# （macOS 自带的 bash 3.2 不支持一次性读入数组的内建命令）：循环不在管道中，
+# 配置全部读完之后才执行 hook，hook 继承的是原始 stdin。
+# while 条件里的 || [[ -n ... ]] 保证末行无换行符时也不丢条目。
+hook_scripts=()
+while IFS= read -r script_name || [[ -n "${script_name}" ]]; do
+    hook_scripts+=("${script_name}")
+done < <(sed -n 's#^pre-commit[[:space:]]*=[[:space:]]*##p' "${WORKTREE}/.cix-ciconfig")
+for script_name in "${hook_scripts[@]}"; do
+    # 去掉行尾 CR（CRLF 配置文件）后再裁掉行尾空白/Tab（保留内部空格），
+    # 空值直接跳过，避免执行空路径。
+    script_name="${script_name%$'\r'}"
+    script_name="${script_name%"${script_name##*[![:space:]]}"}"
+    [[ -z "${script_name}" ]] && continue
+
+    # 绝对路径直接执行；相对路径拼到 hooks/tools/ 下。
+    if [[ "${script_name}" == /* ]]; then
+        script_path="${script_name}"
     else
-        echo eval "${script_name} \"${WORKTREE}\" \"${GIT_DIR}\"" >&2;  # absolute path specified
-        eval "${script_name} \"${WORKTREE}\" \"${GIT_DIR}\"";  # absolute path specified
-        if [[ $? -ne 0 ]]; then
-            exit $?;  # quit if any hook failed
-        fi
+        script_path="${HOOK_DIR}/${script_name}"
+    fi
+
+    # 用数组传参执行：脚本名含空格时仍是单个参数，无需二次解析。
+    hook_cmd=("${script_path}" "${WORKTREE}" "${GIT_DIR}")
+    echo "\"${hook_cmd[0]}\" \"${WORKTREE}\" \"${GIT_DIR}\"" >&2
+    rc=0
+    "${hook_cmd[@]}" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        exit $rc;  # quit if any hook failed
     fi
 done
 `,
@@ -264,11 +311,20 @@ func InitHooks(repoDir string) error {
 
 			hookPath := filepath.Join(hooksDir, name)
 
-			// 检查文件是否已存在且内容相
+			// 检查文件是否已存在且内容相同
 			if fileExists(hookPath) {
 				existingContent, err := os.ReadFile(hookPath)
 				if err == nil && string(existingContent) == content {
-					log.Debug("Hook文件已存在且内容相同，跳过创 %s", hookPath)
+					// 内容一致无需重写，但仍需保证已有 hook 具有执行权限
+					if chmodErr := os.Chmod(hookPath, 0755); chmodErr != nil {
+						errorCh <- &HookError{
+							Op:   "chmod_hook",
+							Path: hookPath,
+							Err:  chmodErr,
+						}
+						return
+					}
+					log.Debug("Hook文件已存在且内容相同，跳过创建 %s", hookPath)
 					return
 				}
 			}
@@ -292,6 +348,17 @@ func InitHooks(repoDir string) error {
 					Path: hookPath,
 					Err:  err,
 				}
+				return
+			}
+
+			// 已存在文件的权限不受 os.WriteFile 的 perm 参数影响，
+			// 因此写入后显式设置 0755，确保 hook 可执行。
+			if err := os.Chmod(hookPath, 0755); err != nil {
+				errorCh <- &HookError{
+					Op:   "chmod_hook",
+					Path: hookPath,
+					Err:  err,
+				}
 			}
 		}(hookName, hookContent)
 	}
@@ -300,14 +367,18 @@ func InitHooks(repoDir string) error {
 	wg.Wait()
 	close(errorCh)
 
-	// 检查是否有错误
-	select {
-	case err := <-errorCh:
-		return err
-	default:
-		log.Info("成功初始化所有Git hooks")
-		return nil
+	// 收集全部错误，避免只返回其中一个而掩盖其他失败
+	errs := make([]error, 0, cap(errorCh))
+	for err := range errorCh {
+		errs = append(errs, err)
 	}
+	if len(errs) > 0 {
+		log.Error("初始化Git hooks failed: %d 个错误", len(errs))
+		return errors.Join(errs...)
+	}
+
+	log.Info("成功初始化所有Git hooks")
+	return nil
 }
 
 // CreateRepoGitConfig 创建repo.git配置文件
@@ -487,9 +558,9 @@ func LinkHooks(projectDir string, hooksDir string) error {
 			srcPath := filepath.Join(hooksDir, e.Name())
 			dstPath := filepath.Join(projectHooksDir, e.Name())
 
-			// 尝试使用符号链接（在支持的系统上
+			// 尝试使用符号链接（在支持的系统上）
 			if trySymlink(srcPath, dstPath) {
-				log.Debug("成功failed to create symlink: %s -> %s", dstPath, srcPath)
+				log.Debug("成功创建符号链接: %s -> %s", dstPath, srcPath)
 				return
 			}
 
@@ -505,7 +576,7 @@ func LinkHooks(projectDir string, hooksDir string) error {
 				}
 			}
 
-			// failed to read source file内
+			// 读取源hook文件内容
 			srcContent, err := os.ReadFile(srcPath)
 			if err != nil {
 				errorCh <- &HookError{
@@ -542,14 +613,18 @@ func LinkHooks(projectDir string, hooksDir string) error {
 	wg.Wait()
 	close(errorCh)
 
-	// 检查是否有错误
-	select {
-	case err := <-errorCh:
-		return err
-	default:
-		log.Info("成功链接所有hooks到项目目 %s", projectDir)
-		return nil
+	// 收集全部错误，避免只返回其中一个而掩盖其他失败
+	errs := make([]error, 0, cap(errorCh))
+	for err := range errorCh {
+		errs = append(errs, err)
 	}
+	if len(errs) > 0 {
+		log.Error("链接hooks到项目目录 failed: %d 个错误", len(errs))
+		return errors.Join(errs...)
+	}
+
+	log.Info("成功链接所有hooks到项目目 %s", projectDir)
+	return nil
 }
 
 // fileExists 检查文件或目录是否存在
@@ -558,16 +633,38 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// trySymlink 尝试failed to create symlink，如果不支持则返回false
+// trySymlink 尝试创建符号链接；当前平台/文件系统不支持时返回 false，
+// 且不会破坏已存在的目标文件（由调用方回退到复制）。
 func trySymlink(src, dst string) bool {
-	// 如果目标文件已存在，先删
-	if fileExists(dst) {
-		if err := os.Remove(dst); err != nil {
+	dir := filepath.Dir(dst)
+
+	// 先在目标目录创建临时符号链接，确认具备符号链接能力后再替换目标。
+	tmpFile, err := os.CreateTemp(dir, ".repo-symlink-*")
+	if err != nil {
+		return false
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+	// 释放临时文件名，供 os.Symlink 使用
+	_ = os.Remove(tmpPath)
+
+	if err := os.Symlink(src, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false
+	}
+
+	// rename 可原子替换目标（Unix）；若平台不允许覆盖已有文件（如 Windows），
+	// 在符号链接已就绪的前提下删除旧目标后重试。
+	if err := os.Rename(tmpPath, dst); err != nil {
+		if removeErr := os.Remove(dst); removeErr != nil && !os.IsNotExist(removeErr) {
+			_ = os.Remove(tmpPath)
+			return false
+		}
+		if err := os.Rename(tmpPath, dst); err != nil {
+			_ = os.Remove(tmpPath)
 			return false
 		}
 	}
 
-	// 尝试failed to create symlink
-	err := os.Symlink(src, dst)
-	return err == nil
+	return true
 }

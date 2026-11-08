@@ -2,11 +2,17 @@ package logger
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"strings"
 	"testing"
 )
 
 func TestNewDefaultLogger(t *testing.T) {
+	// 级别是进程级共享状态，先归位避免受其它测试影响。
+	SetLevel(LogLevelInfo)
+	t.Cleanup(func() { SetLevel(LogLevelInfo) })
+
 	log := NewDefaultLogger()
 	if log == nil {
 		t.Fatal("NewDefaultLogger returned nil")
@@ -56,9 +62,9 @@ func TestLogOutput(t *testing.T) {
 	log := NewDefaultLogger()
 	log.SetLevel(LogLevelInfo)
 
-	// Redirect stdout to capture output
+	// 捕获非错误日志输出
 	var buf bytes.Buffer
-	log.stdout = &buf
+	log.SetOutput(&buf)
 
 	log.Info("test message")
 	output := buf.String()
@@ -75,8 +81,8 @@ func TestLogLevelFiltering(t *testing.T) {
 	log.SetLevel(LogLevelError)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
-	log.stdout = &stdoutBuf
-	log.stderr = &stderrBuf
+	log.SetOutput(&stdoutBuf)
+	log.errOutput = &stderrBuf
 
 	log.Info("should not appear")
 	log.Error("should appear")
@@ -96,7 +102,7 @@ func TestSetTimestampEnabled(t *testing.T) {
 	log.SetTimestampEnabled(false)
 
 	var buf bytes.Buffer
-	log.stdout = &buf
+	log.SetOutput(&buf)
 	log.SetLevel(LogLevelInfo)
 
 	log.Info("test")
@@ -161,7 +167,7 @@ func TestFieldLogger(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	log.stdout = &buf
+	log.SetOutput(&buf)
 	log.SetLevel(LogLevelInfo)
 
 	fl.Info("test with fields")
@@ -171,5 +177,155 @@ func TestFieldLogger(t *testing.T) {
 	}
 	if !strings.Contains(output, "key=value") {
 		t.Errorf("Output should contain field, got: %s", output)
+	}
+}
+
+func TestFieldLoggerPreservesPercentInMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		render func(fl *FieldLogger)
+	}{
+		{name: "Error", render: func(fl *FieldLogger) { fl.Error("progress 100%% %s", "done") }},
+		{name: "Warn", render: func(fl *FieldLogger) { fl.Warn("progress 100%% %s", "done") }},
+		{name: "Info", render: func(fl *FieldLogger) { fl.Info("progress 100%% %s", "done") }},
+		{name: "Debug", render: func(fl *FieldLogger) { fl.Debug("progress 100%% %s", "done") }},
+		{name: "Trace", render: func(fl *FieldLogger) { fl.Trace("progress 100%% %s", "done") }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := NewDefaultLogger()
+			log.SetLevel(LogLevelTrace)
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			log.errOutput = &buf
+
+			tt.render(log.WithFields(map[string]interface{}{"key": "value"}))
+
+			got := buf.String()
+			// 组合后的文本只做一次 Sprintf，% 不得被二次解释
+			if !strings.Contains(got, "progress 100% done") {
+				t.Errorf("消息被二次格式化, got %q", got)
+			}
+			if strings.Contains(got, "%!") {
+				t.Errorf("输出含 fmt 错误标记, got %q", got)
+			}
+			// fields 输出格式保持不变
+			if !strings.Contains(got, "[key=value]") {
+				t.Errorf("字段输出格式丢失, got %q", got)
+			}
+		})
+	}
+}
+
+func TestDefaultLoggerOutputIsStderr(t *testing.T) {
+	log := NewDefaultLogger()
+	if log.output != os.Stderr {
+		t.Errorf("非错误日志默认输出 = %v, want os.Stderr", log.output)
+	}
+	if log.errOutput != os.Stderr {
+		t.Errorf("错误日志默认输出 = %v, want os.Stderr", log.errOutput)
+	}
+}
+
+func TestSetOutputOnlyAffectsNonErrorLogs(t *testing.T) {
+	log := NewDefaultLogger()
+	log.SetLevel(LogLevelInfo)
+
+	var infoBuf, errBuf bytes.Buffer
+	log.SetOutput(&infoBuf)
+	log.errOutput = &errBuf
+
+	log.Info("info-line")
+	log.Error("error-line")
+
+	if !strings.Contains(infoBuf.String(), "info-line") {
+		t.Errorf("非错误日志应写入 SetOutput 目标, got %q", infoBuf.String())
+	}
+	if strings.Contains(infoBuf.String(), "error-line") {
+		t.Error("错误日志不应写入非错误输出")
+	}
+	if !strings.Contains(errBuf.String(), "error-line") {
+		t.Errorf("错误日志应写入 stderr, got %q", errBuf.String())
+	}
+}
+
+func TestSetOutputNilDiscards(t *testing.T) {
+	log := NewDefaultLogger()
+	log.SetOutput(nil)
+	log.SetLevel(LogLevelInfo)
+
+	if log.output != io.Discard {
+		t.Errorf("SetOutput(nil) 后输出 = %v, want io.Discard", log.output)
+	}
+	// 不应 panic，也不应写 stderr
+	log.Info("discarded")
+}
+
+// TestSetLevelAffectsAllLoggers 验证日志级别是进程级状态：
+// 命令在自身实例上设置级别后，包级 logger 也立即生效。
+func TestSetLevelAffectsAllLoggers(t *testing.T) {
+	SetLevel(LogLevelInfo)
+	t.Cleanup(func() { SetLevel(LogLevelInfo) })
+
+	packageLog := NewDefaultLogger() // 模拟 internal 包的包级 logger
+	commandLog := NewDefaultLogger() // 模拟命令级 logger
+	var buf bytes.Buffer
+	packageLog.SetOutput(&buf)
+
+	commandLog.SetLevel(LogLevelError) // -q
+	if got := packageLog.GetLevel(); got != LogLevelError {
+		t.Fatalf("包级 logger 级别 = %v, want Error", got)
+	}
+	packageLog.Info("quiet-info-suppressed")
+	if strings.Contains(buf.String(), "quiet-info-suppressed") {
+		t.Errorf("-q 级别下包级 logger 仍输出 Info: %q", buf.String())
+	}
+
+	commandLog.SetLevel(LogLevelDebug) // -v
+	packageLog.Debug("verbose-debug-visible")
+	if !strings.Contains(buf.String(), "verbose-debug-visible") {
+		t.Errorf("-v 级别下包级 logger 未输出 Debug: %q", buf.String())
+	}
+}
+
+// TestQuietLevelSuppressesInfo 验证 -q（Error 级别）抑制 Info/Warn/Debug。
+func TestQuietLevelSuppressesInfo(t *testing.T) {
+	SetLevel(LogLevelInfo)
+	t.Cleanup(func() { SetLevel(LogLevelInfo) })
+
+	log := NewDefaultLogger()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetLevel(LogLevelError)
+
+	log.Info("info-hidden")
+	log.Debug("debug-hidden")
+	log.Warn("warn-hidden")
+
+	if buf.Len() != 0 {
+		t.Errorf("-q 下非错误日志不应输出，got %q", buf.String())
+	}
+}
+
+// TestVerboseLevelEnablesDebug 验证 -v（Debug 级别）打开 Debug 输出。
+func TestVerboseLevelEnablesDebug(t *testing.T) {
+	SetLevel(LogLevelInfo)
+	t.Cleanup(func() { SetLevel(LogLevelInfo) })
+
+	log := NewDefaultLogger()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetLevel(LogLevelDebug)
+
+	if !log.IsDebugEnabled() {
+		t.Error("Debug 级别下 IsDebugEnabled() 应为 true")
+	}
+	log.Debug("debug-visible")
+	if !strings.Contains(buf.String(), "debug-visible") {
+		t.Errorf("-v 下 Debug 日志未输出: %q", buf.String())
+	}
+	if strings.Contains(buf.String(), "[TRACE]") {
+		t.Errorf("Debug 级别不应输出 Trace: %q", buf.String())
 	}
 }

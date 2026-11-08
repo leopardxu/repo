@@ -213,6 +213,8 @@ func TestSyncFailFastInterruptsInFlightRetry(t *testing.T) {
 	})
 	e.options.Jobs = 2
 	e.options.FailFast = true
+	// 保持"在途 clone 重试被取消唤醒"的测试意图（--retry-fetches 上游默认 0）。
+	e.options.RetryFetches = 5
 	e.SetProjects([]*project.Project{pFail, pSlow})
 	defer e.Cleanup()
 

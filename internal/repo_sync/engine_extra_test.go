@@ -2,9 +2,11 @@ package repo_sync
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/leopardxu/repo-go/internal/config"
 	"github.com/leopardxu/repo-go/internal/logger"
 	"github.com/leopardxu/repo-go/internal/manifest"
 	"github.com/leopardxu/repo-go/internal/project"
@@ -69,7 +71,7 @@ func TestEngineFetchRetries(t *testing.T) {
 		retryFetch int
 		want       int
 	}{
-		{"default", 0, 3},
+		{"zero means no retries", 0, 0},
 		{"custom", 5, 5},
 		{"one", 1, 1},
 	}
@@ -251,13 +253,13 @@ func TestResolveRemoteURLAbsolutePassthrough(t *testing.T) {
 		RemoteURL:  "ssh://git@gitmirror.cixcomputing.com:29418/cix_opensource/release/edk2-non-osi",
 	}
 
-	if got := e.resolveRemoteURL(p); got != p.RemoteURL {
-		t.Errorf("resolveRemoteURL(absolute) = %q, want passthrough %q", got, p.RemoteURL)
+	if got, err := e.resolveRemoteURL(p); err != nil || got != p.RemoteURL {
+		t.Errorf("resolveRemoteURL(absolute) = (%q, %v), want passthrough %q", got, err, p.RemoteURL)
 	}
 }
 
 // TestResolveRemoteURLRelativeAppendsName 验证相对 fetch 仍走解析路径：
-// 基于 manifest 远程 URL 的父目录解析（对齐上游 urljoin 语义）并拼接项目名。
+// 基于清单仓库 URL（urljoin 语义）解析并只拼接一次项目名。
 func TestResolveRemoteURLRelativeAppendsName(t *testing.T) {
 	e := &Engine{
 		logger:  logger.NewDefaultLogger(),
@@ -267,14 +269,196 @@ func TestResolveRemoteURLRelativeAppendsName(t *testing.T) {
 		},
 	}
 	p := &project.Project{
-		Name:       "platform/build",
-		RemoteName: "origin",
-		RemoteURL:  "..",
+		Name:        "platform/build",
+		RemoteName:  "origin",
+		RemoteURL:   "..",
+		ManifestURL: "https://example.com/manifests",
 	}
 
-	// ".." 相对 fetch：以 https://example.com/manifests 为基准取父目录，再拼项目名
+	// ".." 相对 fetch：以 https://example.com/manifests 为基准做 urljoin，再拼项目名
 	const want = "https://example.com/platform/build"
-	if got := e.resolveRemoteURL(p); got != want {
+	got, err := e.resolveRemoteURL(p)
+	if err != nil {
+		t.Fatalf("resolveRemoteURL(..) error = %v", err)
+	}
+	if got != want {
 		t.Errorf("resolveRemoteURL(..) = %q, want %q", got, want)
+	}
+}
+
+// TestResolveRemoteURLRelativeVariants 覆盖相对 fetch 的 urljoin 语义：
+// "."、"./"、".."、"../<path>"，以及解析后绝对 URL 的幂等透传。
+func TestResolveRemoteURLRelativeVariants(t *testing.T) {
+	tests := []struct {
+		name        string
+		manifestURL string
+		remoteURL   string
+		want        string
+		wantErr     bool
+	}{
+		{
+			name:        "dot stays in manifest dir",
+			manifestURL: "https://example.com/manifests",
+			remoteURL:   ".",
+			want:        "https://example.com/proj",
+		},
+		{
+			name:        "dot slash stays in manifest dir",
+			manifestURL: "https://example.com/manifests",
+			remoteURL:   "./",
+			want:        "https://example.com/proj",
+		},
+		{
+			name:        "dot dot pops manifest repo",
+			manifestURL: "https://example.com/manifests",
+			remoteURL:   "..",
+			want:        "https://example.com/proj",
+		},
+		{
+			name:        "parent with path",
+			manifestURL: "https://example.com/cix/manifests",
+			remoteURL:   "../platform",
+			want:        "https://example.com/platform/proj",
+		},
+		{
+			name:        "non-dot relative fetch",
+			manifestURL: "https://example.com/manifests",
+			remoteURL:   "platform",
+			want:        "https://example.com/platform/proj",
+		},
+		{
+			name:        "nested non-dot relative fetch",
+			manifestURL: "https://example.com/manifests",
+			remoteURL:   "platform/build",
+			want:        "https://example.com/platform/build/proj",
+		},
+		{
+			name:        "non-dot relative fetch with ssh base",
+			manifestURL: "ssh://git@example.com:29418/manifests",
+			remoteURL:   "platform",
+			want:        "ssh://git@example.com:29418/platform/proj",
+		},
+		{
+			name:        "ssh base",
+			manifestURL: "ssh://git@example.com:29418/manifests",
+			remoteURL:   "..",
+			want:        "ssh://git@example.com:29418/proj",
+		},
+		{
+			name:        "scp base normalized to ssh",
+			manifestURL: "git@example.com:manifests/manifest.git",
+			remoteURL:   "..",
+			want:        "ssh://git@example.com/proj",
+		},
+		{
+			name:        "local file path base",
+			manifestURL: "/srv/manifests/manifest.git",
+			remoteURL:   "..",
+			want:        "/srv/proj",
+		},
+		{
+			name:        "missing base fails",
+			manifestURL: "",
+			remoteURL:   "..",
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &Engine{logger: logger.NewDefaultLogger(), options: &Options{}}
+			p := &project.Project{
+				Name:        "proj",
+				RemoteName:  "origin",
+				RemoteURL:   tt.remoteURL,
+				ManifestURL: tt.manifestURL,
+			}
+			got, err := e.resolveRemoteURL(p)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveRemoteURL(%q) = %q, want error", tt.remoteURL, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveRemoteURL(%q) error = %v", tt.remoteURL, err)
+			}
+			if got != tt.want {
+				t.Errorf("resolveRemoteURL(%q) = %q, want %q", tt.remoteURL, got, tt.want)
+			}
+			// 幂等：解析后的绝对 URL 再次解析必须原样返回。
+			p.RemoteURL = got
+			again, err := e.resolveRemoteURL(p)
+			if err != nil || again != got {
+				t.Errorf("resolveRemoteURL(%q) second pass = (%q, %v), want %q", got, again, err, got)
+			}
+		})
+	}
+}
+
+// TestManifestGroupsUsesEffectiveGroups 验证同步/智能同步解析清单时的组回退：
+// 显式 Groups 优先；为空时使用 config.EffectiveGroups()（未配置时为 "default"）。
+func TestManifestGroupsUsesEffectiveGroups(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []string
+		cfg  *config.Config
+		want []string
+	}{
+		{
+			name: "explicit groups win",
+			opts: []string{"cix"},
+			cfg:  &config.Config{Groups: "default"},
+			want: []string{"cix"},
+		},
+		{
+			name: "config groups used",
+			cfg:  &config.Config{Groups: "default,cix"},
+			want: []string{"default", "cix"},
+		},
+		{
+			name: "explicit empty groups cancels filtering",
+			opts: []string{},
+			cfg:  &config.Config{Groups: "default"},
+			want: []string{},
+		},
+		{
+			name: "empty config groups fall back to default",
+			cfg:  &config.Config{},
+			want: []string{"default"},
+		},
+		{
+			name: "nil config keeps no filter",
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &Engine{options: &Options{Groups: tt.opts}, config: tt.cfg}
+			if got := e.manifestGroups(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("manifestGroups() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveRemoteURLUsesFetchBaseWithoutDoubleName 验证清单项目的相对
+// RemoteURL 已含项目名时，使用原始 FetchBase 重新解析，避免 /name/name。
+func TestResolveRemoteURLUsesFetchBaseWithoutDoubleName(t *testing.T) {
+	e := &Engine{logger: logger.NewDefaultLogger(), options: &Options{}}
+	p := &project.Project{
+		Name:        "proj",
+		RemoteName:  "origin",
+		FetchBase:   "..",
+		RemoteURL:   "../proj", // manager 在无法解析基址时可能保留的中间形态
+		ManifestURL: "https://example.com/manifests",
+	}
+	got, err := e.resolveRemoteURL(p)
+	if err != nil {
+		t.Fatalf("resolveRemoteURL() error = %v", err)
+	}
+	if want := "https://example.com/proj"; got != want {
+		t.Errorf("resolveRemoteURL() = %q, want %q (must not duplicate project name)", got, want)
 	}
 }

@@ -21,6 +21,35 @@ type checkoutStats struct {
 	mu            sync.Mutex
 }
 
+// dedupeCheckoutProjects 按项目身份（名称 + 工作树/路径）去重，保持原顺序。
+// 命令行参数解析与引擎调用方都可能传入重复项目；检出/统计必须按项目只做一次。
+func dedupeCheckoutProjects(projects []*project.Project) []*project.Project {
+	if len(projects) < 2 {
+		if len(projects) == 1 && projects[0] == nil {
+			return nil
+		}
+		return projects
+	}
+	seen := make(map[string]struct{}, len(projects))
+	deduped := make([]*project.Project, 0, len(projects))
+	for _, p := range projects {
+		if p == nil {
+			continue
+		}
+		keyPath := p.Worktree
+		if keyPath == "" {
+			keyPath = p.Path
+		}
+		key := p.Name + "\x00" + keyPath
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, p)
+	}
+	return deduped
+}
+
 // SetBranchName 设置要检出的分支名称
 func (e *Engine) SetBranchName(branchName string) {
 	e.branchName = branchName
@@ -28,6 +57,9 @@ func (e *Engine) SetBranchName(branchName string) {
 
 // GetCheckoutStats 获取检出操作的统计信息
 func (e *Engine) GetCheckoutStats() (int, int) {
+	if e.checkoutStats == nil {
+		return 0, 0
+	}
 	return e.checkoutStats.Success, e.checkoutStats.Failed
 }
 
@@ -45,6 +77,9 @@ func (e *Engine) CheckoutBranch(projects []*project.Project) error {
 	if e.branchName == "" {
 		return fmt.Errorf("branch name is not specified")
 	}
+
+	// 重复的项目只检出一次，避免同一项目被并发检出并重复计入统计。
+	projects = dedupeCheckoutProjects(projects)
 
 	e.logger.Info("开始检出分支'%s' 到%d 个项目", e.branchName, len(projects))
 
@@ -67,8 +102,9 @@ func (e *Engine) CheckoutBranch(projects []*project.Project) error {
 
 	// 执行检出
 	if len(worktreeProjects) == 0 {
-		e.logger.Info("没有可检出的项目")
-		return nil
+		// 对齐上游：没有任何项目可检出（无工作树或全部未同步）时报错，
+		// 不能静默成功。
+		return fmt.Errorf("no project has branch %s", e.branchName)
 	}
 
 	if e.options.JobsCheckout == 1 {
@@ -154,7 +190,10 @@ func (e *Engine) processCheckoutResult(result CheckoutResult, pm progress.Report
 	}
 
 	if !e.options.Quiet {
-		pm.Update(1, result.Project.Name)
+		// 进度使用累计已处理项目数（含成功/失败/分支不存在），
+		// 让 Reporter 的 current 与绝对计数语义一致。
+		cumulative := e.checkoutStats.Success + e.checkoutStats.Failed + e.checkoutStats.BranchMissing
+		pm.Update(cumulative, result.Project.Name)
 	}
 }
 

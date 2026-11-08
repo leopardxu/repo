@@ -36,6 +36,24 @@ func SplitGroups(s string) []string {
 	return splitTrimGroups(s)
 }
 
+// unionGroupStrings 合并两个 groups 字符串：拆分、去重（保留首次出现顺序）
+// 后以逗号拼回。空输入返回另一侧；两侧皆空返回空串。
+func unionGroupStrings(existing, added string) string {
+	parts := append(splitTrimGroups(existing), splitTrimGroups(added)...)
+	return strings.Join(dedupStrings(parts), ",")
+}
+
+// unionGroupLists 合并两个组列表（去重、保留首次出现顺序）。
+func unionGroupLists(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(a)+len(b))
+	out = append(out, a...)
+	out = append(out, b...)
+	return dedupStrings(out)
+}
+
 // dedupStrings 去重，保留首次出现的顺序。用于 EffectiveGroups 合并显式与隐式组后去重，
 // 处理显式 name:<name> 与隐式 name:<name> 撞名等情况。
 func dedupStrings(in []string) []string {

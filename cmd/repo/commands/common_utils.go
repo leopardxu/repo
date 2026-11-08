@@ -6,7 +6,28 @@ import (
 
 	"github.com/leopardxu/repo-go/internal/config"
 	"github.com/leopardxu/repo-go/internal/logger"
+	"github.com/leopardxu/repo-go/internal/project"
 )
+
+// dedupeProjects 按项目身份（名称 + 工作区相对路径）去重，保留首次出现顺序。
+// 重复的项目参数不应导致同一项目被重复处理（例如并发重复删除分支）。
+// abandon/branch/checkout/prune/rebase 共用此实现，避免同包重复定义。
+func dedupeProjects(projects []*project.Project) []*project.Project {
+	seen := make(map[string]bool, len(projects))
+	out := make([]*project.Project, 0, len(projects))
+	for _, p := range projects {
+		if p == nil {
+			continue
+		}
+		key := p.Name + "\x00" + p.Path
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, p)
+	}
+	return out
+}
 
 // EnsureRepoRoot 确保当前working directory在repo根目录下
 // 如果不在，则切换到repo根目录

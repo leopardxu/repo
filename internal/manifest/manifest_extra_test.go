@@ -66,8 +66,12 @@ func TestParseDefaultRemoteFromSingleRemote(t *testing.T) {
 	if m.Default.Remote != "aosp" {
 		t.Errorf("Default.Remote = %q, want aosp (auto-assigned)", m.Default.Remote)
 	}
-	if m.Default.Revision != "main" {
-		t.Errorf("Default.Revision = %q, want main (from remote)", m.Default.Revision)
+	// 上游 _ParseProject：remote.revision 是项目级回退，不会写入 Default.Revision
+	if m.Default.Revision != "" {
+		t.Errorf("Default.Revision = %q, want empty（remote revision 不灌入 default）", m.Default.Revision)
+	}
+	if m.Projects[0].Revision != "main" {
+		t.Errorf("Project[0].Revision = %q, want main（继承 remote revision）", m.Projects[0].Revision)
 	}
 }
 
@@ -257,15 +261,16 @@ func TestParseExtendProject(t *testing.T) {
 	if len(m.Projects) != 1 {
 		t.Fatalf("Projects count = %d, want 1", len(m.Projects))
 	}
-	if m.Projects[0].Groups != "new" {
-		t.Errorf("Project groups = %q, want new (extended)", m.Projects[0].Groups)
+	// 上游 extend-project 的 groups 与项目现有组取并集，而非替换
+	if m.Projects[0].Groups != "old,new" {
+		t.Errorf("Project groups = %q, want old,new (extended union)", m.Projects[0].Groups)
 	}
 	if m.Projects[0].Revision != "dev" {
 		t.Errorf("Project revision = %q, want dev (extended)", m.Projects[0].Revision)
 	}
 }
 
-func TestParseDeduplication(t *testing.T) {
+func TestParseDuplicatePathError(t *testing.T) {
 	xml := `<?xml version="1.0" encoding="UTF-8"?>
 <manifest>
   <remote name="origin" fetch="https://example.com/" />
@@ -276,14 +281,31 @@ func TestParseDeduplication(t *testing.T) {
 </manifest>`
 
 	parser := NewParser()
-	m, err := parser.Parse([]byte(xml), nil)
-	if err != nil {
-		t.Fatalf("Parse() error: %v", err)
+	_, err := parser.Parse([]byte(xml), nil)
+	if err == nil {
+		t.Fatal("Parse() expected duplicate path error")
 	}
+	if !strings.Contains(err.Error(), "duplicate path") {
+		t.Fatalf("error = %v, want duplicate path", err)
+	}
+}
 
-	// Duplicate project (same name+path) should be removed
-	if len(m.Projects) != 2 {
-		t.Errorf("Projects count = %d, want 2 (deduplicated)", len(m.Projects))
+func TestParseDuplicatePathDifferentName(t *testing.T) {
+	xml := `<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="origin" fetch="https://example.com/" />
+  <default remote="origin" revision="main" />
+  <project path="shared" name="a" />
+  <project path="shared" name="b" />
+</manifest>`
+
+	parser := NewParser()
+	_, err := parser.Parse([]byte(xml), nil)
+	if err == nil {
+		t.Fatal("Parse() expected duplicate path error")
+	}
+	if !strings.Contains(err.Error(), "duplicate path") {
+		t.Fatalf("error = %v, want duplicate path", err)
 	}
 }
 

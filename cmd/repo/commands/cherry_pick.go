@@ -110,7 +110,7 @@ func runCherryPick(opts *CherryPickOptions, args []string) error {
 	}
 
 	parser := manifest.NewParser()
-	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.Groups))
+	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.EffectiveGroups()))
 	if err != nil {
 		log.Error("failed to parse manifest file: %v", err)
 		return fmt.Errorf("failed to parse manifest: %w", err)

@@ -70,7 +70,7 @@ func runOverview(opts *OverviewOptions, args []string) error {
 	opts.Config = cfg
 
 	parser := manifest.NewParser()
-	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.Groups))
+	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.EffectiveGroups()))
 	if err != nil {
 		return fmt.Errorf("failed to parse manifest: %w", err)
 	}
@@ -80,7 +80,7 @@ func runOverview(opts *OverviewOptions, args []string) error {
 	if len(args) == 0 {
 		projects, err = manager.GetProjectsInGroups(nil)
 	} else {
-		projects, err = manager.GetProjectsByNames(args)
+		projects, err = manager.GetProjectsByArgs(args, originalDir)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get projects: %w", err)
@@ -91,6 +91,7 @@ func runOverview(opts *OverviewOptions, args []string) error {
 		Branch  string
 		Commits string
 		Count   int
+		Note    string
 	}
 
 	var entries []*overviewEntry
@@ -106,19 +107,28 @@ func runOverview(opts *OverviewOptions, args []string) error {
 		}
 		branch := strings.TrimSpace(string(branchOut))
 
-		// 尚未推送的本地提交：manifest revision..HEAD
+		// 尚未推送的本地提交：manifest revision..HEAD。
+		// base 必须先解析为提交（远端跟踪 ref/SHA 优先），解析失败时显式标注，
+		// 不得静默当作 0 个提交。
+		base, ok := overviewResolveBase(p, manifestObj.Remotes, log)
+		if !ok {
+			note := fmt.Sprintf("无法解析 manifest revision %q，无法统计未推送提交", p.Revision)
+			log.Warn("项目 %s %s", p.Name, note)
+			entries = append(entries, &overviewEntry{Project: p, Branch: branch, Note: note})
+			continue
+		}
 		var commits string
 		count := 0
-		if p.Revision != "" {
-			logOut, lErr := p.GitRepo.RunCommand("log", "--oneline", p.Revision+"..HEAD")
-			if lErr == nil {
-				commits = strings.TrimSpace(string(logOut))
-				if commits != "" {
-					count = strings.Count(commits, "\n") + 1
-				}
-			} else {
-				log.Debug("项目 %s 计算 %s..HEAD failed: %v", p.Name, p.Revision, lErr)
-			}
+		logOut, lErr := p.GitRepo.RunCommand("log", "--oneline", base+"..HEAD")
+		if lErr != nil {
+			note := fmt.Sprintf("计算 %s..HEAD failed: %v", base, lErr)
+			log.Warn("项目 %s %s", p.Name, note)
+			entries = append(entries, &overviewEntry{Project: p, Branch: branch, Note: note})
+			continue
+		}
+		commits = strings.TrimSpace(string(logOut))
+		if commits != "" {
+			count = strings.Count(commits, "\n") + 1
 		}
 		// 默认仅显示有未推送提交的项目；--verbose 显示全部
 		if count == 0 && !opts.Verbose {
@@ -130,19 +140,50 @@ func runOverview(opts *OverviewOptions, args []string) error {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Project.Name < entries[j].Project.Name })
 
 	if len(entries) == 0 {
-		log.Info("没有未推送的本地提交")
+		readCmdResultLine("没有未推送的本地提交")
 		return nil
 	}
 
 	for _, e := range entries {
+		if e.Note != "" {
+			readCmdResultLine("project %s (%s): %s", readCmdProjectRelpath(e.Project), e.Branch, e.Note)
+			continue
+		}
 		if e.Count > 0 {
-			log.Info("project %s (%s): %d 个未推送提交", e.Project.Name, e.Branch, e.Count)
+			readCmdResultLine("project %s (%s): %d 个未推送提交", readCmdProjectRelpath(e.Project), e.Branch, e.Count)
 			if e.Commits != "" {
-				log.Info("%s", e.Commits)
+				readCmdResultLine("%s", e.Commits)
 			}
 		} else {
-			log.Info("project %s (%s): 无未推送提交", e.Project.Name, e.Branch)
+			readCmdResultLine("project %s (%s): 无未推送提交", readCmdProjectRelpath(e.Project), e.Branch)
 		}
 	}
 	return nil
+}
+
+// overviewResolveBase 解析 overview 的比较基准：SHA 与 refs/tags 原样，
+// 分支名与 refs/heads/X 先 refs/remotes/<remote>/X，再回退 refs/heads/X；
+// 裸 revision 不作为 tag（tags 仅显式 refs/tags/ 前缀）。remotes 用于把清单
+// remote name 映射成实际 git remote 名（有 alias 时用 alias）。解析成功后
+// 返回提交 id。解析失败返回 ok=false，由调用方标注而不是静默当 0。
+func overviewResolveBase(p *project.Project, remotes []manifest.Remote, log logger.Logger) (string, bool) {
+	if p == nil || p.GitRepo == nil {
+		return "", false
+	}
+	remote := readCmdRemoteRefName(p.RemoteName, remotes)
+	if remote == "" {
+		remote = "origin"
+	}
+	candidates := readCmdRevisionCandidates(p.Revision, remote, true)
+	for _, candidate := range candidates {
+		out, err := p.GitRepo.RunCommand("rev-parse", "--verify", candidate+"^{commit}")
+		if err != nil {
+			log.Debug("项目 %s 解析 revision 候选 %s failed: %v", p.Name, candidate, err)
+			continue
+		}
+		if id := strings.TrimSpace(string(out)); id != "" {
+			return id, true
+		}
+	}
+	return "", false
 }

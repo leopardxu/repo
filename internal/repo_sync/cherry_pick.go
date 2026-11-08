@@ -142,7 +142,8 @@ func (e *Engine) processCherryPickResult(result CherryPickResult, pm progress.Re
 	}
 
 	if !e.options.Quiet {
-		pm.Update(1, result.Project.Name)
+		// 进度使用累计已处理项目数，避免并发下固定传 1 导致计数失真。
+		pm.Update(e.cherryPickStats.Success+e.cherryPickStats.Failed, result.Project.Name)
 	}
 }
 

@@ -36,14 +36,76 @@ type GitCommandError struct { //nolint:revive // 命名遵循 CLAUDE.md 约定�
 }
 
 func (e *GitCommandError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "git command error: '%s' in dir '%s'", e.Command, e.Dir)
 	if e.ExitCode != 0 {
-		return fmt.Sprintf("git command error: '%s' in dir '%s': exit code %d: %v", e.Command, e.Dir, e.ExitCode, e.Err)
+		fmt.Fprintf(&b, ": exit code %d", e.ExitCode)
 	}
-	return fmt.Sprintf("git command error: '%s' in dir '%s': %v", e.Command, e.Dir, e.Err)
+	if e.Err != nil {
+		fmt.Fprintf(&b, ": %v", e.Err)
+	}
+
+	// 携带 git 自身的诊断输出：-q 模式下 runner 不再把 stderr 打到日志，
+	// 调用方（如 init 的错误分类）只能从错误文本获取诊断信息。
+	// 部分命令把关键信息写在 stdout，两者都保留；内容相同的只追加一次。
+	msg := b.String()
+	msg = appendGitDiagnostic(msg, e.Stderr)
+	msg = appendGitDiagnostic(msg, e.Stdout)
+	return msg
+}
+
+// appendGitDiagnostic 把 trim 后的 git 输出追加到错误文本。
+// 空输出或已出现过的文本不会重复追加，避免 stdout/stderr 相同时重复拼接。
+func appendGitDiagnostic(msg, output string) string {
+	diagnostic := strings.TrimSpace(output)
+	if diagnostic == "" || strings.Contains(msg, diagnostic) {
+		return msg
+	}
+	return msg + ": " + diagnostic
 }
 
 func (e *GitCommandError) Unwrap() error {
 	return e.Err
+}
+
+// gitRepositoryEnvVars 列出会改变 git 仓库定位的环境变量。
+// 父进程（例如在某个仓库内启动 repo）残留这些变量时，必须从子进程环境中剔除，
+// 否则对不同目录执行的 git 命令会被重定向到错误仓库或索引。
+var gitRepositoryEnvVars = []string{
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_GRAFT_FILE",
+}
+
+// isRepositoryEnvVar 判断变量名是否属于需要净化的 git 仓库定位变量。
+func isRepositoryEnvVar(name string) bool {
+	for _, key := range gitRepositoryEnvVars {
+		if strings.EqualFold(name, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildGitEnv 构造 git 子进程环境：复制当前进程环境后删除仓库定位变量，
+// 再追加调用方显式设置的环境变量（显式值优先，例如 forall 镜像项目需要 GIT_DIR）。
+func buildGitEnv(explicit map[string]string) []string {
+	environ := os.Environ()
+	env := make([]string, 0, len(environ)+len(explicit))
+	for _, kv := range environ {
+		name, _, found := strings.Cut(kv, "=")
+		if found && isRepositoryEnvVar(name) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	for k, v := range explicit {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 // defaultRunner 是默认的Git命令运行器实
@@ -145,8 +207,58 @@ func (r *defaultRunner) RunInDirWithTimeout(dir string, timeout time.Duration, a
 	return r.runGitCommand(dir, timeout, args...)
 }
 
-// runGitCommand 是执git 命令的内部辅助函
+// RunInDirWithStderr 在指定目录执行 Git 命令，并同时返回 stdout 与 stderr。
+// 命令失败时也返回已捕获的输出，供调用方展示远端诊断信息。
+func (r *defaultRunner) RunInDirWithStderr(dir string, args ...string) ([]byte, []byte, error) {
+	return r.runGitCommandWithStderr(dir, 0, args...)
+}
+
+// RunInteractiveInDir 在指定目录执行需要终端交互的 Git 命令。
+// stdin/stdout/stderr 直接连接当前进程，使 git add -i/-p 等命令可以真正与用户交互；
+// 交互命令不设置超时，由用户自行结束。
+func (r *defaultRunner) RunInteractiveInDir(dir string, args ...string) error {
+	r.mutex.RLock()
+	env := r.environment
+	r.mutex.RUnlock()
+
+	cmdArgs := append([]string{}, args...)
+	cmdStr := fmt.Sprintf("git %s", strings.Join(cmdArgs, " "))
+	log.Debug("交互执行: %s 在目'%s'", cmdStr, dir)
+
+	cmd := exec.Command("git", cmdArgs...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	// 与普通 Run* 路径一致：净化继承的仓库定位变量，再追加显式环境。
+	cmd.Env = buildGitEnv(env)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		exitCode := 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+		return &GitCommandError{
+			Command:  cmdStr,
+			Dir:      dir,
+			Err:      err,
+			ExitCode: exitCode,
+		}
+	}
+	return nil
+}
+
+// runGitCommand 执行 git 命令，仅返回 stdout（保留既有调用方语义）。
 func (r *defaultRunner) runGitCommand(dir string, timeout time.Duration, args ...string) ([]byte, error) {
+	stdout, _, err := r.runGitCommandWithStderr(dir, timeout, args...)
+	return stdout, err
+}
+
+// runGitCommandWithStderr 是执行 git 命令的内部辅助函数，同时返回
+// stdout/stderr；失败时也返回已捕获的输出。
+func (r *defaultRunner) runGitCommandWithStderr(dir string, timeout time.Duration, args ...string) ([]byte, []byte, error) {
 	// 获取并发控制信号
 	r.mutex.RLock()
 	semaphore := r.semaphore
@@ -212,14 +324,9 @@ func (r *defaultRunner) runGitCommand(dir string, timeout time.Duration, args ..
 			cmd.Dir = dir
 		}
 
-		// 设置环境变量：保留系统环境（os.Environ），追加/覆盖用户自定义变量。
-		// 对齐上游 repo 行为：git 子进程继承父进程环境（含 HTTP_PROXY、GIT_*、SSH_* 等）。
-		if env != nil {
-			cmd.Env = os.Environ()
-			for k, v := range env {
-				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-			}
-		}
+		// 设置环境变量：复制系统环境但剔除仓库定位变量，再追加调用方显式变量，
+		// 避免父进程的 GIT_DIR/GIT_WORK_TREE 等把命令重定向到其它仓库。
+		cmd.Env = buildGitEnv(env)
 
 		// 如果设置了REPO_TRACE，记录环境变量
 		if repoTrace {
@@ -296,11 +403,11 @@ func (r *defaultRunner) runGitCommand(dir string, timeout time.Duration, args ..
 			if attempt > 0 {
 				log.Info("Git命令在第 %d 次尝试后成功: %s", attempt+1, cmdStr)
 			}
-			return stdoutBytes, nil
+			return stdoutBytes, stderrBytes, nil
 		}
 	}
 
-	return stdoutBytes, lastErr
+	return stdoutBytes, stderrBytes, lastErr
 }
 
 // shouldRetry determines whether a git command failure should be retried.

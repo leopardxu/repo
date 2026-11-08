@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -26,6 +28,53 @@ type StatusOptions struct {
 	Branch    bool
 	Unshelved bool // -u/--unshelved：上游已废弃，接受但无效果
 	Config    *config.Config
+}
+
+// readCmdResultLine 把一行结果 payload 写入 stdout。结果数据（项目路径、分支、
+// porcelain 状态、缺失提示等）必须走 stdout；logger 仅承载诊断信息（stderr），
+// 这样 `repo status >file` 等重定向能得到干净结果，且 -q 不会吞掉结果。
+func readCmdResultLine(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stdout, format+"\n", args...)
+}
+
+// readCmdProjectRelpath 返回用于展示的项目相对路径。
+// 镜像项目的 Path/Gitdir 可能是绝对裸库路径，展示必须用 Relpath；普通项目
+// Relpath 同样存在。两者都为空时才回退 Name。
+func readCmdProjectRelpath(p *project.Project) string {
+	if p == nil {
+		return ""
+	}
+	if p.Relpath != "" {
+		return p.Relpath
+	}
+	if p.Path != "" {
+		return p.Path
+	}
+	return p.Name
+}
+
+// readCmdProjectExists 判断项目仓库是否已存在：镜像项目检查裸库 Gitdir/Objdir，
+// 普通项目检查工作树。用于 list 默认过滤（对齐上游 Project.Exists）。
+func readCmdProjectExists(p *project.Project) bool {
+	if p == nil {
+		return false
+	}
+	if p.Mirror {
+		repoDir := p.Gitdir
+		if repoDir == "" {
+			repoDir = p.Objdir
+		}
+		if repoDir == "" {
+			return false
+		}
+		info, err := os.Stat(repoDir)
+		return err == nil && info.IsDir()
+	}
+	if p.Worktree == "" {
+		return false
+	}
+	info, err := os.Stat(p.Worktree)
+	return err == nil && info.IsDir()
 }
 
 // statusStats 用于统计状态检查结果
@@ -82,6 +131,7 @@ func StatusCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&opts.Unshelved, "unshelved", "u", false, "show unshelved changes (deprecated, no effect)")
 	cmd.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "only show errors")
 	cmd.Flags().BoolVarP(&opts.Verbose, "verbose", "v", false, "show all output including debug logs")
+	cmd.Flags().StringVarP(&opts.Groups, "groups", "g", "", "restrict execution to projects in specified groups (comma-separated)")
 	AddManifestFlags(cmd, &opts.CommonManifestOptions)
 
 	return cmd
@@ -112,42 +162,34 @@ func runStatus(opts *StatusOptions, args []string, log logger.Logger) error {
 	}
 	opts.Config = cfg
 
-	// 加载清单
+	// 加载清单（显式 --groups 优先，否则 cfg.Groups；只解析一次）
 	log.Debug("正在加载清单文件: %s", cfg.ManifestName)
 	parser := manifest.NewParser()
-	manifest, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.Groups))
+	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, readCmdEffectiveGroups(opts.Groups, cfg))
 	if err != nil {
 		log.Error("failed to parse manifest: %v", err)
 		return fmt.Errorf("failed to parse manifest: %w", err)
 	}
-	log.Debug("成功加载清单，包含 %d 个项目", len(manifest.Projects))
+	log.Debug("成功加载清单，包含 %d 个项目", len(manifestObj.Projects))
 
 	// 创建项目管理器
 	log.Debug("正在初始化项目管理器...")
-	manager := project.NewManagerFromManifest(manifest, cfg)
+	manager := project.NewManagerFromManifest(manifestObj, cfg)
 
-	// 获取要处理的项目
+	// 获取要处理的项目（位置参数走上游名字+路径回溯语义）
 	var projects []*project.Project
-
 	if len(args) == 0 {
-		// 如果没有指定项目，则处理所有项目
 		log.Debug("获取所有项目..")
 		projects, err = manager.GetProjectsInGroups(nil)
-		if err != nil {
-			log.Error("failed to get projectfailed: %v", err)
-			return fmt.Errorf("failed to get projects: %w", err)
-		}
-		log.Debug("共获取到 %d 个项目", len(projects))
 	} else {
-		// 否则，只处理指定的项目
-		log.Debug("根据名称failed to get project: %v", args)
-		projects, err = manager.GetProjectsByNames(args)
-		if err != nil {
-			log.Error("根据名称failed to get projectfailed: %v", err)
-			return fmt.Errorf("failed to get projects by name: %w", err)
-		}
-		log.Debug("共获取到 %d 个项目", len(projects))
+		log.Debug("解析项目参数: %v", args)
+		projects, err = manager.GetProjectsByArgs(args, originalDir)
 	}
+	if err != nil {
+		log.Error("failed to get projectfailed: %v", err)
+		return fmt.Errorf("failed to get projects: %w", err)
+	}
+	log.Debug("共获取到 %d 个项目", len(projects))
 
 	// 使用goroutine池并发failed to get project状态
 	// 规范化并发数：-j <= 0 会导致 makechan panic，回退到默认 8（与其他命令一致）
@@ -160,6 +202,7 @@ func runStatus(opts *StatusOptions, args []string, log logger.Logger) error {
 		Project *project.Project
 		Branch  string
 		Status  string
+		Missing bool
 		Err     error
 	}
 
@@ -178,6 +221,12 @@ func runStatus(opts *StatusOptions, args []string, log logger.Logger) error {
 
 			log.Debug("正在检查项目 %s 的状态...", p.Name)
 
+			// 未检出项目：输出 missing 提示，不视为失败
+			if readCmdProjectMissing(p) {
+				results <- statusResult{Project: p, Missing: true}
+				return
+			}
+
 			status, err := p.GetStatus()
 			if err != nil {
 				log.Error("failed to get project %s 状态failed %v", p.Name, err)
@@ -187,13 +236,9 @@ func runStatus(opts *StatusOptions, args []string, log logger.Logger) error {
 				log.Debug("项目 %s 状态检查完成", p.Name)
 			}
 
-			// -b/--branch：获取当前分支名用于显示
-			var branch string
-			if opts.Branch {
-				if bOut, bErr := p.GitRepo.RunCommand("rev-parse", "--abbrev-ref", "HEAD"); bErr == nil {
-					branch = strings.TrimSpace(string(bOut))
-				}
-			}
+			// 始终解析当前分支：干净项目也要显示 project/branch 头（对齐上游）。
+			// detached HEAD 返回空串，渲染为 (*** NO BRANCH ***)。
+			branch := statusBranchName(p)
 
 			results <- statusResult{
 				Project: p,
@@ -210,49 +255,79 @@ func runStatus(opts *StatusOptions, args []string, log logger.Logger) error {
 		close(results)
 	}()
 
+	// 收集结果并按 manifest 项目顺序输出，保证确定性（上游使用 ordered 并行结果）。
+	collected := make([]statusResult, 0, len(projects))
+	for res := range results {
+		collected = append(collected, res)
+	}
+	order := make(map[*project.Project]int, len(projects))
+	for i, p := range projects {
+		order[p] = i
+	}
+	sort.SliceStable(collected, func(i, j int) bool {
+		return order[collected[i].Project] < order[collected[j].Project]
+	})
+
 	// 处理结果
 	var errs []error
-	for res := range results {
+	rendered := 0
+	cleanDetached := 0
+	for _, res := range collected {
+		rendered++
+		if res.Missing {
+			readCmdResultLine("project %s/", readCmdProjectRelpath(res.Project))
+			readCmdResultLine("  missing (run \"repo sync\")")
+			continue
+		}
 		if res.Err != nil {
 			errs = append(errs, fmt.Errorf("项目 %s: %w", res.Project.Name, res.Err))
 			continue
 		}
 
-		// 默认跳过无变更的项目以减少噪声；--verbose 显示全部；-b 显示所有项目的分支
-		if strings.TrimSpace(res.Status) == "" && !opts.Verbose && !opts.Branch {
+		status := strings.TrimRight(res.Status, "\n")
+		clean := strings.TrimSpace(status) == ""
+		// 上游语义：干净且 detached（无分支）的项目视为 CLEAN，不输出项目头；
+		// 干净但在分支上的项目仍输出 project/branch 头。-b/--verbose 是 repo-go
+		// 扩展，强制显示 CLEAN 项目。
+		if clean && res.Branch == "" && !opts.Verbose && !opts.Branch {
+			cleanDetached++
 			continue
 		}
-		// 输出格式对齐上游 repo status：project <path>/ 头，可选 branch 行，再是状态输出
-		log.Info("project %s/", res.Project.Path)
-		if opts.Branch && res.Branch != "" {
-			log.Info("branch %s", res.Branch)
-		}
-		if s := strings.TrimRight(res.Status, "\n"); s != "" {
-			log.Info("%s", s)
+
+		readCmdResultLine("%s", statusProjectHeaderLine(readCmdProjectRelpath(res.Project), res.Branch, opts.Quiet))
+		if !opts.Quiet && status != "" {
+			readCmdResultLine("%s", status)
 		}
 	}
+	// 与上游一致：所有项目均为 CLEAN（干净 detached）且非 quiet 时输出汇总。
+	if !opts.Quiet && rendered > 0 && cleanDetached == rendered {
+		readCmdResultLine("nothing to commit (working directory clean)")
+	}
 
-	// --orphans：列出 repoRoot 顶层中不属于任何 manifest 项目的目录（工作树孤儿）
+	// --orphans：递归扫描工作树中未被任何 manifest 项目覆盖的文件/目录
 	if opts.Orphans {
-		relPaths := make([]string, 0, len(manifest.Projects))
-		for _, mp := range manifest.Projects {
+		relPaths := make([]string, 0, len(manifestObj.Projects))
+		for _, mp := range manifestObj.Projects {
 			rel := mp.Path
 			if rel == "" {
 				rel = mp.Name
 			}
 			relPaths = append(relPaths, rel)
 		}
-		if orphans, oerr := computeOrphanDirs(cfg.RepoRoot, relPaths); oerr != nil {
+		orphans, oerr := computeOrphanDirs(cfg.RepoRoot, relPaths)
+		if oerr != nil {
 			log.Warn("扫描 orphan 目录failed: %v", oerr)
 		} else if len(orphans) > 0 {
-			log.Info("orphan projects (in working tree, not in manifest):")
-			for _, name := range orphans {
-				log.Info("project %s/", name)
+			readCmdResultLine("Objects not within a project (orphans):")
+			for _, entry := range orphans {
+				readCmdResultLine(" --\t%s", entry)
 			}
+		} else {
+			readCmdResultLine("No orphan files or directories")
 		}
 	}
 
-	// 显示统计信息
+	// 统计信息属于诊断输出（stderr），不污染 stdout 结果 payload
 	log.Info("状态检查操作完成，总计: %d，成功 %d，failed %d", stats.total, stats.success, stats.failed)
 
 	// 如果有错误，返回汇总错误
@@ -263,34 +338,103 @@ func runStatus(opts *StatusOptions, args []string, log logger.Logger) error {
 	return nil
 }
 
-// computeOrphanDirs 列出 repoRoot 顶层目录中不属于任何 manifest 项目的目录
-// （即"孤儿"工作树目录）。一个顶层目录被视为被项目覆盖当且仅当它与某项目相对
-// 路径相等，或是某项目相对路径的前缀段（支持 "external/foo" 这类嵌套项目）。
-// 始终跳过 .repo。结果按目录名排序以保证确定性。
-func computeOrphanDirs(repoRoot string, projectRelPaths []string) ([]string, error) {
-	entries, err := os.ReadDir(repoRoot)
+// statusBranchName 返回当前分支短名；detached HEAD 或解析失败返回空串。
+func statusBranchName(p *project.Project) string {
+	out, err := p.GitRepo.Runner.RunInDir(p.GitRepo.Path, "symbolic-ref", "-q", "HEAD")
 	if err != nil {
-		return nil, err
+		return ""
 	}
-	var orphans []string
-	for _, e := range entries {
-		if !e.IsDir() {
+	ref := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return ""
+	}
+	return strings.TrimPrefix(ref, "refs/heads/")
+}
+
+// statusProjectHeaderLine 生成上游格式的项目头：
+//   - project 头使用 "%-40s" 填充（参数为 "path/ "），branch 紧接同一行；
+//   - detached 项目显示 (*** NO BRANCH ***)；
+//   - quiet 只输出项目头（无 branch、无文件明细）。
+func statusProjectHeaderLine(relPath, branch string, quiet bool) string {
+	line := fmt.Sprintf("project %-40s", relPath+"/ ")
+	if quiet {
+		return line
+	}
+	if branch == "" {
+		return line + "(*** NO BRANCH ***)"
+	}
+	return line + "branch " + branch
+}
+
+// computeOrphanDirs 递归扫描 repoRoot，返回工作树中不属于任何 manifest 项目的
+// 文件与目录（相对 repoRoot 的路径；目录带尾部 "/"）。未被覆盖的目录整体报告，
+// 若某目录是项目的祖先目录则继续深入，确保 "dir/subdir/proj3" 这类嵌套孤儿不会
+// 因父目录被覆盖而漏报。覆盖判定按项目相对路径的完整路径段前缀（精确分隔符），
+// ".repo" 始终跳过。目录判定跟随符号链接（os.Stat），并用 realpath 去重防止
+// 符号链接循环。结果排序以保证确定性。
+func computeOrphanDirs(repoRoot string, projectRelPaths []string) ([]string, error) {
+	projDirs := make(map[string]bool, len(projectRelPaths)+1)
+	projParents := make(map[string]bool, len(projectRelPaths))
+	for _, rel := range projectRelPaths {
+		rel = filepath.ToSlash(filepath.Clean(rel))
+		rel = strings.TrimPrefix(rel, "./")
+		if rel == "" || rel == "." || rel == ".." {
 			continue
 		}
-		name := e.Name()
-		if name == ".repo" {
-			continue
+		projDirs[rel] = true
+		for head := path.Dir(rel); head != "." && head != "/" && head != ""; head = path.Dir(head) {
+			projParents[head] = true
 		}
-		covered := false
-		for _, rel := range projectRelPaths {
-			if rel == name || strings.HasPrefix(rel, name+"/") {
-				covered = true
-				break
+	}
+	projDirs[".repo"] = true
+
+	orphans := make([]string, 0)
+	// visited 记录已遍历目录的 realpath，防止符号链接形成循环导致无限递归。
+	visited := make(map[string]bool)
+	var walk func(relDir string) error
+	walk = func(relDir string) error {
+		dir := repoRoot
+		if relDir != "" {
+			dir = filepath.Join(repoRoot, filepath.FromSlash(relDir))
+		}
+		if realDir, err := filepath.EvalSymlinks(dir); err == nil {
+			realDir = filepath.Clean(realDir)
+			if visited[realDir] {
+				return nil
 			}
+			visited[realDir] = true
 		}
-		if !covered {
-			orphans = append(orphans, name)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
 		}
+		for _, e := range entries {
+			rel := e.Name()
+			if relDir != "" {
+				rel = path.Join(relDir, e.Name())
+			}
+			// 必须跟随符号链接判断目录：DirEntry.IsDir 对指向目录的符号链接
+			// 返回 false，会把符号链接项目/父目录误报为孤儿文件。
+			info, statErr := os.Stat(filepath.Join(dir, e.Name()))
+			if statErr != nil || !info.IsDir() {
+				orphans = append(orphans, rel)
+				continue
+			}
+			if projDirs[rel] {
+				continue
+			}
+			if projParents[rel] {
+				if err := walk(rel); err != nil {
+					return err
+				}
+				continue
+			}
+			orphans = append(orphans, rel+"/")
+		}
+		return nil
+	}
+	if err := walk(""); err != nil {
+		return nil, err
 	}
 	sort.Strings(orphans)
 	return orphans, nil

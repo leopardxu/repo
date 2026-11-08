@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -150,7 +151,7 @@ func runStart(opts *StartOptions, args []string, log logger.Logger) error {
 	// 加载清单
 	log.Debug("正在加载清单文件: %s", opts.Config.ManifestName)
 	parser := manifest.NewParser()
-	manifest, err := parser.ParseFromFile(opts.Config.ManifestName, manifest.SplitGroups(opts.Config.Groups))
+	manifest, err := parser.ParseFromFile(opts.Config.ManifestName, manifest.SplitGroups(opts.Config.EffectiveGroups()))
 	if err != nil {
 		log.Error("failed to parse manifest: %v", err)
 		return fmt.Errorf("failed to parse manifest: %w", err)
@@ -191,6 +192,14 @@ func runStart(opts *StartOptions, args []string, log logger.Logger) error {
 			return fmt.Errorf("failed to get projects: %w", err)
 		}
 		log.Debug("共获取到 %d 个项目", len(projects))
+	}
+
+	// 镜像项目没有工作树，无法创建/切换分支：运行前明确拒绝，避免静默失败。
+	for _, p := range projects {
+		if p.Mirror {
+			log.Error("项目 %s 是镜像项目（无工作树），无法创建分支", p.Name)
+			return fmt.Errorf("project %s: mirror project has no working tree; start requires a working directory", p.Name)
+		}
 	}
 
 	// 使用goroutine池并发创建分支
@@ -327,12 +336,12 @@ func runStart(opts *StartOptions, args []string, log logger.Logger) error {
 		errs = append(errs, err)
 	}
 
-	// 输出结果
+	// 输出结果：命令 payload 走 stdout（可被调用方捕获），诊断日志仍走 logger。
 	for result := range resultChan {
-		log.Info("%s", result)
+		fmt.Fprintf(os.Stdout, "%s\n", result)
 	}
 
-	// 显示统计信息
+	// 显示统计信息（诊断输出，保持走 logger/默认 stderr）
 	log.Info("分支创建操作完成，总计: %d，成功 %d，failed %d", stats.total, stats.success, stats.failed)
 
 	// 如果有错误，返回汇总错误

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -72,25 +73,27 @@ func NewMultiError(errs []error) error {
 
 // Engine 同步引擎
 type Engine struct {
-	projects        []*project.Project
-	config          *config.Config
-	options         *Options
-	logger          logger.Logger
-	progressReport  progress.Reporter
-	workerPool      *workerpool.WorkerPool
-	repoRoot        string
-	errors          []error
-	errorsMu        sync.Mutex
-	manifestCache   []byte
-	manifest        *manifest.Manifest
-	ctx             context.Context  // 添加 ctx 字段
-	branchName      string           // 要检出的分支名称
-	checkoutStats   *checkoutStats   // 检出操作的统计信息（repo checkout 命令使用）
-	commitHash      string           // 要cherry-pick的提交哈希
-	cherryPickStats *cherryPickStats // cherry-pick操作的统计信息
-	networkSem      chan struct{}    // 限制并发网络操作数（fetch/clone）
-	checkoutSem     chan struct{}    // 限制并发检出操作数
-	gitRunner       git.Runner       // 统一的 Git 命令执行器（替代直接 exec.Command）
+	projects          []*project.Project
+	config            *config.Config
+	options           *Options
+	logger            logger.Logger
+	progressReport    progress.Reporter
+	workerPool        *workerpool.WorkerPool
+	repoRoot          string
+	errors            []error
+	errorsMu          sync.Mutex
+	manifestCache     []byte
+	manifest          *manifest.Manifest
+	ctx               context.Context  // 添加 ctx 字段
+	branchName        string           // 要检出的分支名称
+	checkoutStats     *checkoutStats   // 检出操作的统计信息（repo checkout 命令使用）
+	commitHash        string           // 要cherry-pick的提交哈希
+	cherryPickStats   *cherryPickStats // cherry-pick操作的统计信息
+	networkSem        chan struct{}    // 限制并发网络操作数（fetch/clone）
+	checkoutSem       chan struct{}    // 限制并发检出操作数
+	gitRunner         git.Runner       // 统一的 Git 命令执行器（替代直接 exec.Command）
+	projectSubset     map[string]bool  // SetProjectSubset 指定的项目子集（smart-sync 重载后据此过滤）
+	smartSyncImplicit bool             // 智能同步由清单 <default sync-smartsync> 隐式启用（允许告警回退）
 }
 
 // NewEngine 创建同步引擎
@@ -152,9 +155,18 @@ func NewEngineWithContext(ctx context.Context, options *Options, manifest *manif
 	gitRunner.SetMaxRetries(0)
 	gitRunner.SetConcurrency(options.Jobs)
 
+	// 配置在构造函数中解析/加载一次，worker 只读，避免并发写入 e.config 的数据竞态
+	resolvedConfig := options.Config
+	if resolvedConfig == nil {
+		if loaded, loadErr := config.Load(); loadErr == nil {
+			resolvedConfig = loaded
+			options.Config = loaded
+		}
+	}
+
 	return &Engine{
 		projects:       projects,
-		config:         options.Config, // 透传配置，供 smart-sync 重载清单等使用
+		config:         resolvedConfig, // 透传配置，供 smart-sync 重载清单等使用
 		options:        options,
 		manifest:       manifest,
 		logger:         log,
@@ -179,6 +191,10 @@ func (e *Engine) Sync() error {
 	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel() // 确保函数退出时取消上下文
 
+	// 0. --default-remote：清单未给出项目 remote 名时用它兜底
+	// （在 preSync/smart-sync 重载清单前先应用一次，重载后再次应用）。
+	e.applyDefaultRemoteToProjects()
+
 	// 1.2 预处理：超级目 / 智能同步 / HyperSync
 	if err := e.preSync(ctx); err != nil {
 		return err
@@ -187,14 +203,19 @@ func (e *Engine) Sync() error {
 	// HyperSync 可能将同步范围缩减为已变更目的子集
 	syncProjects := e.projects
 	if e.options.HyperSync {
-		hyper, err := e.getHyperSyncProjects()
-		if err != nil {
-			e.logger.Warn("Failed to get HyperSync projects，将同步所有目: %v", err)
-		} else if len(hyper) == 0 {
-			e.logger.Info("HyperSync: No projects need updating")
-			return nil
+		if e.options.LocalOnly {
+			// --local-only 禁止任何网络操作：不向清单服务器发 HTTP，退化为全量本地同步。
+			e.logger.Info("--local-only 禁用网络：跳过 HyperSync 查询，按全量项目执行本地同步")
 		} else {
-			syncProjects = hyper
+			hyper, err := e.getHyperSyncProjects()
+			if err != nil {
+				e.logger.Warn("Failed to get HyperSync projects，将同步所有目: %v", err)
+			} else if len(hyper) == 0 {
+				e.logger.Info("HyperSync: No projects need updating")
+				return nil
+			} else {
+				syncProjects = hyper
+			}
 		}
 	}
 
@@ -258,7 +279,7 @@ func (e *Engine) Sync() error {
 
 				progressMsg := fmt.Sprintf("%s: %s (进度: %d/%d, 成功: %d, failed: %d%s)",
 					project.Name, status, current, totalProjects,
-					successCount, failCount, etaStr)
+					atomic.LoadInt32(&successCount), atomic.LoadInt32(&failCount), etaStr)
 				e.progressReport.Update(int(current), progressMsg)
 			}
 
@@ -324,19 +345,46 @@ func (e *Engine) Sync() error {
 // preSync 执行同步前的可选预处理：超级目修订 ID 与智能同步清单重载。
 // 任一特性仅在对应选启用时触发；未配置 manifest-server/superproject 时给出告警而非中断。
 func (e *Engine) preSync(_ context.Context) error {
-	// --use-superproject：用超级目覆盖各目的修订 ID
-	if e.options.UseSuperproject {
-		if _, err := e.updateProjectsRevisionID(); err != nil {
-			return fmt.Errorf("use-superproject failed: %w", err)
-		}
+	// --smart-sync / --smart-tag：从 manifest-server 获取已审批清单并重载。
+	// 清单 <default sync-smartsync="true"> 可隐式启用智能同步；隐式启用失败
+	// （无服务器/网络错误）时告警并回退常规同步，显式请求则必须报错。
+	implicitSmartSync := false
+	if e.options.SmartSync || e.options.SmartTag != "" {
+		implicitSmartSync = e.smartSyncImplicit
+	} else if !e.options.LocalOnly && defaultSyncSmartSyncEnabled(e.manifest) {
+		e.options.SmartSync = true
+		e.smartSyncImplicit = true
+		implicitSmartSync = true
 	}
-
-	// --smart-sync / --smart-tag：从 manifest-server 获取已审批清单并重载
 	if e.options.SmartSync || e.options.SmartTag != "" {
 		if err := e.handleSmartSync(); err != nil {
-			return fmt.Errorf("smart-sync failed: %w", err)
+			if implicitSmartSync {
+				e.logger.Warn("smart sync 失败，回退到常规同步: %v", err)
+				e.options.SmartSync = false
+				e.smartSyncImplicit = false
+			} else {
+				return fmt.Errorf("smart-sync failed: %w", err)
+			}
 		}
 		// handleSmartSync 重载了清单并刷新了 e.projects
+	}
+
+	// --use-superproject：用超级项目覆盖各项目的修订 ID。
+	// 清单未定义 <superproject> 时按上游语义告警并跳过，不中断同步。
+	if e.options.UseSuperproject {
+		if e.manifest == nil || e.manifest.Superproject == nil {
+			e.logger.Warn("清单中未定义 <superproject>，跳过 --use-superproject")
+		} else if e.options.LocalOnly {
+			// --local-only 禁止网络：不 fetch 超级项目，复用已有的
+			// .repo/superproject-manifest.xml（上游 _ReloadManifest 语义）。
+			if ok, err := e.applySuperprojectRevisionsFromFile(); err != nil {
+				e.logger.Warn("本地复用超级项目清单 failed，跳过 --use-superproject: %v", err)
+			} else if !ok {
+				e.logger.Warn("--local-only 下未找到 .repo/superproject-manifest.xml，跳过 --use-superproject")
+			}
+		} else if _, err := e.updateProjectsRevisionID(); err != nil {
+			return fmt.Errorf("use-superproject failed: %w", err)
+		}
 	}
 
 	// --force-remove-dirty 当前尚未在活动同步路径中实现（需带安全护栏的工作树移除，
@@ -372,26 +420,18 @@ func (e *Engine) UpdateManifestRepo() error {
 		return nil
 	}
 
-	// 使用 git -C 参数在指定目录执行命令，避免 os.Chdir 的线程安全问题
-	gitRunner := git.NewRunner()
+	// 使用 git -C 参数在指定目录执行命令，避免 os.Chdir 的线程安全问题。
+	// 优先复用引擎的 Runner（测试可注入零重试 Runner，也保持统一配置）。
+	gitRunner := e.gitRunner
+	if gitRunner == nil {
+		gitRunner = git.NewRunner()
+	}
 
 	// 获取更新前的 HEAD 提交哈希以检查是否有更新
 	oldHeadOutput, err := gitRunner.RunInDir(manifestProjectPath, "rev-parse", "HEAD")
 	oldHead := strings.TrimSpace(string(oldHeadOutput))
 	if err != nil {
 		e.logger.Debug("获取当前 HEAD failed: %v", err)
-	}
-
-	// 执行 fetch 操作
-	e.logger.Debug("Fetching manifest repository updates...")
-	_, err = gitRunner.RunInDir(manifestProjectPath, "fetch", "origin")
-	if err != nil {
-		e.logger.Debug("fetch origin failed: %v, trying fetch --all", err)
-		// 尝试获取所有远程分支
-		_, fetchErr := gitRunner.RunInDir(manifestProjectPath, "fetch", "--all")
-		if fetchErr != nil {
-			e.logger.Debug("fetch --all also failed: %v", fetchErr)
-		}
 	}
 
 	// 确定要同步的目标引用（对齐上游 repo：使用 manifest_branch 配置，回退到当前分支）
@@ -407,22 +447,69 @@ func (e *Engine) UpdateManifestRepo() error {
 		manifestBranch = strings.TrimSpace(string(branchOutput))
 	}
 
+	// -b 指定完整提交 ID（40 位 SHA-1 或 64 位 SHA-256）时，直接获取该对象
+	// 并 reset 到它，绝不能回退到默认分支。
+	if isCommitHash(manifestBranch) {
+		if _, shaFetchErr := gitRunner.RunInDir(manifestProjectPath, "fetch", "origin", manifestBranch); shaFetchErr != nil {
+			// 服务端可能禁止按 SHA fetch：退化为获取全部引用，只要本地已有
+			// 该对象即可继续（“或 upstream ref”路径）。
+			if _, fetchOriginErr := gitRunner.RunInDir(manifestProjectPath, "fetch", "origin"); fetchOriginErr != nil {
+				if _, fetchAllErr := gitRunner.RunInDir(manifestProjectPath, "fetch", "--all"); fetchAllErr != nil {
+					return fmt.Errorf("failed to fetch manifest repository: %w",
+						errors.Join(shaFetchErr, fetchOriginErr, fetchAllErr))
+				}
+			}
+			if _, objErr := gitRunner.RunInDir(manifestProjectPath, "cat-file", "-e", manifestBranch+"^{commit}"); objErr != nil {
+				return fmt.Errorf("manifest revision %s not found in remote: %w", manifestBranch, shaFetchErr)
+			}
+		}
+
+		e.logger.Debug("Resetting manifest to commit %s...", manifestBranch)
+		if _, resetErr := gitRunner.RunInDir(manifestProjectPath, "reset", "--hard", manifestBranch); resetErr != nil {
+			return fmt.Errorf("failed to reset manifest repository to %s: %w", manifestBranch, resetErr)
+		}
+		return e.finishManifestUpdate(manifestProjectPath, gitRunner, oldHead)
+	}
+
+	// 执行 fetch 操作：origin 与 --all 均失败必须返回错误，runSync 的致命
+	// 处理才能生效，避免带着过期清单继续同步。
+	e.logger.Debug("Fetching manifest repository updates...")
+	if _, err = gitRunner.RunInDir(manifestProjectPath, "fetch", "origin"); err != nil {
+		e.logger.Debug("fetch origin failed: %v, trying fetch --all", err)
+		// 尝试获取所有远程分支
+		if _, fetchErr := gitRunner.RunInDir(manifestProjectPath, "fetch", "--all"); fetchErr != nil {
+			return fmt.Errorf("failed to fetch manifest repository: %w",
+				errors.Join(err, fmt.Errorf("fetch --all: %w", fetchErr)))
+		}
+	}
+
 	// 对齐上游 repo：使用 git reset --hard 而非 merge，确保 manifest 仓库
 	// 始终与远程一致，避免 merge conflict 导致同步卡住。
 	// 上游 manifestProject.Sync_NetworkHalf + Sync_LocalHalf 的核心行为就是
 	// fetch 后 reset --hard 到远程分支。
 	remoteRef := "origin/" + manifestBranch
 	e.logger.Debug("Resetting manifest to %s...", remoteRef)
-	_, err = gitRunner.RunInDir(manifestProjectPath, "reset", "--hard", remoteRef)
-	if err != nil {
-		// 如果指定分支不存在，尝试不指定分支（使用当前跟踪的远程分支）
-		e.logger.Debug("reset --hard %s failed, trying HEAD", remoteRef)
-		_, err = gitRunner.RunInDir(manifestProjectPath, "reset", "--hard", "FETCH_HEAD")
-		if err != nil {
-			return fmt.Errorf("failed to update manifest repository: %w", err)
+	if _, resetErr := gitRunner.RunInDir(manifestProjectPath, "reset", "--hard", remoteRef); resetErr != nil {
+		// 仅当远端分支确实不存在时才允许回退到 FETCH_HEAD；分支存在却
+		// reset 失败（如工作树被锁）必须报错，不能静默换目标。
+		if _, verifyErr := gitRunner.RunInDir(manifestProjectPath, "rev-parse", "--verify", "refs/remotes/"+remoteRef); verifyErr == nil {
+			return fmt.Errorf("failed to reset manifest repository to %s: %w", remoteRef, resetErr)
+		}
+		if _, fetchHeadErr := gitRunner.RunInDir(manifestProjectPath, "rev-parse", "--verify", "FETCH_HEAD"); fetchHeadErr != nil {
+			return fmt.Errorf("remote branch %s not found and FETCH_HEAD is unavailable: %w", remoteRef, resetErr)
+		}
+		e.logger.Debug("remote branch %s does not exist, falling back to FETCH_HEAD", remoteRef)
+		if _, fallbackErr := gitRunner.RunInDir(manifestProjectPath, "reset", "--hard", "FETCH_HEAD"); fallbackErr != nil {
+			return fmt.Errorf("failed to update manifest repository: %w", fallbackErr)
 		}
 	}
 
+	return e.finishManifestUpdate(manifestProjectPath, gitRunner, oldHead)
+}
+
+// finishManifestUpdate 在 manifest 仓库 HEAD 变化后重新生成 .repo/manifest.xml。
+// 重新生成失败只记录日志（与原有行为一致），不阻断后续同步。
+func (e *Engine) finishManifestUpdate(manifestProjectPath string, gitRunner git.Runner, oldHead string) error {
 	// 检查是否有更新
 	newHeadOutput, err := gitRunner.RunInDir(manifestProjectPath, "rev-parse", "HEAD")
 	newHead := strings.TrimSpace(string(newHeadOutput))
@@ -468,39 +555,10 @@ func (e *Engine) regenerateManifestXML() error {
 		return fmt.Errorf("failed to parse main manifest file: %w", err)
 	}
 
-	// 处理 include 标签
-	if len(mainManifest.Includes) > 0 {
-		e.logger.Info("处理 %d 个 include 标签", len(mainManifest.Includes))
-		merger := manifest.NewMerger(parser, filepath.Join(e.repoRoot, ".repo", "manifests"))
-
-		// 创建包含所有清单的切片，从主清单开始
-		allManifests := []*manifest.Manifest{mainManifest}
-
-		// 处理每个 include
-		for _, include := range mainManifest.Includes {
-			includePath := filepath.Join(e.repoRoot, ".repo", "manifests", include.Name)
-			e.logger.Debug("加载包含的 manifest: %s", include.Name)
-
-			includeManifest, err := parser.ParseFromFile(includePath, nil)
-			if err != nil {
-				e.logger.Warn("解析包含的 manifest %s failed: %v", include.Name, err)
-				continue
-			}
-
-			allManifests = append(allManifests, includeManifest)
-		}
-
-		// 合并所有清单
-		mergedManifest, err := merger.Merge(allManifests)
-		if err != nil {
-			return fmt.Errorf("failed to merge manifests: %w", err)
-		}
-
-		mainManifest = mergedManifest
-	}
-
-	// 目已在 ParseFromFile 阶段按组过滤（shouldIncludeProject -> MatchesGroupFilter），
-	// 合并仅累加已过滤的子清单目，无需再次过滤。
+	// ParseFromFile 已在解析阶段递归处理 include 并把子清单项目合并进 Projects、
+	// remote/notice 等，这里直接使用已合并的清单，禁止再次 Parse+Merge 覆盖。
+	// 生成扁平清单前清空 Includes，避免输出仍引用子清单的 include 元素。
+	mainManifest.Includes = nil
 
 	// 生成合并后的 manifest XML
 	mergedData, err := mainManifest.ToXML()
@@ -540,12 +598,14 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d秒", s)
 }
 
-// fetchRetries 返回 fetch/clone 的重试次数，取自 --retry-fetches，默认 3。
+// fetchRetries 返回 fetch/clone 的重试次数，取自 --retry-fetches。
+// 上游 repo 默认值为 0（不重试）；0 是合法且必须可表达的配置，
+// 因此这里不做哨兵值替换。
 func (e *Engine) fetchRetries() int {
-	if e.options.RetryFetches > 0 {
-		return e.options.RetryFetches
+	if e.options == nil || e.options.RetryFetches < 0 {
+		return 0
 	}
-	return 3
+	return e.options.RetryFetches
 }
 
 // syncProject 同步单个目
@@ -558,9 +618,9 @@ func (e *Engine) syncProject(ctx context.Context, p *project.Project) error {
 		return fmt.Errorf("checking project %s failed: %w", p.Name, err)
 	}
 
-	// 检查是否为镜像模式
-	isMirror := false
-	if e.options.Config != nil && e.options.Config.Mirror {
+	// 检查是否为镜像模式：项目布局（p.Mirror）优先，兼容配置驱动
+	isMirror := p.Mirror
+	if !isMirror && e.options.Config != nil && e.options.Config.Mirror {
 		isMirror = true
 		if !e.options.Quiet {
 			e.logger.Debug("目 %s 使用镜像模式", p.Name)
@@ -568,6 +628,18 @@ func (e *Engine) syncProject(ctx context.Context, p *project.Project) error {
 	}
 
 	if !exists {
+		// --local-only 明确禁止网络操作：缺失项目不能 clone，按上游返回同款错误，
+		// 提示用户先执行网络同步。
+		if e.options.LocalOnly {
+			return &SyncError{
+				ProjectName: p.Name,
+				Phase:       "local_sync",
+				Err: fmt.Errorf(
+					"Cannot checkout %s due to missing network sync; Run `repo sync -n %s` first.",
+					p.Name, p.Name),
+				Timestamp: time.Now(),
+			}
+		}
 		// Cloning project
 		if !e.options.Quiet {
 			e.logger.Info("Cloning project: %s", p.Name)
@@ -611,12 +683,13 @@ func (e *Engine) syncProject(ctx context.Context, p *project.Project) error {
 			}
 			e.logger.Info("成功处理目 %s 更新后的链接文件和复制文件", p.Name)
 
-			// 处理 submodule（如果启用）
+			// 处理 submodule（如果启用）：失败必须计入项目失败，不能只打日志。
 			if err := e.updateSubmodules(ctx, p); err != nil {
-				e.logger.Error("目 %s 更新 submodule failed: %v", p.Name, err)
-				// submodule 更新failed不阻断整个同步流程，只记录错误
-				if !e.options.Quiet {
-					e.logger.Warn("跳过目 %s 的 submodule 更新", p.Name)
+				return &SyncError{
+					ProjectName: p.Name,
+					Phase:       "submodule_update",
+					Err:         err,
+					Timestamp:   time.Now(),
 				}
 			}
 		} else {
@@ -627,216 +700,155 @@ func (e *Engine) syncProject(ctx context.Context, p *project.Project) error {
 	return nil
 }
 
-// trimLastPathSegment safely removes the last path segment from a URL,
-// preserving protocol and hostname components.
-func trimLastPathSegment(url string) string {
-	url = strings.TrimSuffix(url, "/")
-	hasProtocol := strings.Contains(url, "://")
-	parts := strings.Split(url, "/")
-	if len(parts) <= 3 && hasProtocol {
-		// URL is protocol://host or protocol://host/, keep as-is
-		return url
+// isAbsoluteRemoteURL 判断是否为已完整的远程地址：带 scheme（含 scp 风式）
+// 或绝对文件路径。其余值（"."、".."、"platform"、"foo/bar" 等）都必须按
+// 清单仓库 URL 做 urljoin，绝不能原样交给 git。
+func isAbsoluteRemoteURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if strings.Contains(raw, "://") {
+		return true
 	}
-	return strings.Join(parts[:len(parts)-1], "/")
+	// scheme（如 ssh:host/path）或 scp 风式 [user@]host:path：冒号位于首个 '/' 之前。
+	if i := strings.Index(raw, ":"); i > 0 && !strings.Contains(raw[:i], "/") {
+		return true
+	}
+	return filepath.IsAbs(raw)
 }
 
-// resolveBaseURLFromManifest resolves the base URL from the manifest's remote definitions.
-// Returns the remote fetch URL and the resolved remote name.
-func (e *Engine) resolveBaseURLFromManifest(p *project.Project) (baseURL, remoteName string) {
-	if e.manifest == nil {
-		return "", ""
+// resolveURLAgainstManifest 以清单仓库 URL 为基准，把 fetch/pushurl 基址按
+// urljoin 语义解析为完整地址（非点前缀相对值如 "platform" 同样解析）。
+// 无法解析时返回错误，绝不把相对值原样交给 git。
+func resolveURLAgainstManifest(manifestURL, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("URL 为空")
 	}
-
-	remoteName = p.RemoteName
-	if remoteName == "" {
-		if e.options != nil && e.options.DefaultRemote != "" {
-			remoteName = e.options.DefaultRemote
-			if e.options.Verbose && e.logger != nil {
-				e.logger.Debug("project %s has no remote, using default remote from CLI: %s", p.Name, remoteName)
-			}
-		} else if e.manifest.Default.Remote != "" {
-			remoteName = e.manifest.Default.Remote
-			if e.options.Verbose && e.logger != nil {
-				e.logger.Debug("project %s has no remote, using manifest default: %s", p.Name, remoteName)
-			}
+	if manifestURL != "" {
+		resolver := &config.Config{ManifestURL: manifestURL}
+		if resolved := resolver.ResolveRelativeURL(raw); resolved != "" {
+			return resolved, nil
 		}
 	}
-
-	if remoteName != "" {
-		var err error
-		baseURL, err = e.manifest.GetRemoteURL(remoteName)
-		if err == nil && baseURL != "" {
-			if e.options.Verbose && e.logger != nil {
-				e.logger.Debug("resolved remote %s URL from manifest: %s", remoteName, baseURL)
-			}
-		} else if e.logger != nil {
-			e.logger.Debug("failed to get remote %s URL from manifest: %v", remoteName, err)
-		}
+	// 无 scheme 的相对本地清单路径：config.ResolveRelativeURL 以“缺少可用
+	// baseline”返回空，这里按清单文件所在目录做本地 urljoin。
+	if manifestURL != "" && !strings.Contains(manifestURL, "://") && !isAbsoluteRemoteURL(manifestURL) {
+		return filepath.Join(filepath.Dir(filepath.FromSlash(manifestURL)), filepath.FromSlash(raw)), nil
 	}
-
-	return baseURL, remoteName
+	return "", fmt.Errorf("无法基于清单 URL %q 解析相对地址 %q", manifestURL, raw)
 }
 
-// resolveBaseURLFromConfig resolves a base URL from the configuration file
-// when the manifest does not provide one. Falls back to reading .repo/config.json directly.
-func (e *Engine) resolveBaseURLFromConfig() string {
-	var manifestURL string
-
-	if e.config != nil && e.config.ManifestURL != "" {
-		manifestURL = e.config.ManifestURL
-		if e.options.Verbose && e.logger != nil {
-			e.logger.Debug("using loaded config ManifestURL: %s", manifestURL)
-		}
-	} else {
-		cfg, err := config.Load()
-		if err == nil && cfg != nil {
-			e.config = cfg
-			manifestURL = cfg.ManifestURL
-			if e.options.Verbose && e.logger != nil {
-				e.logger.Debug("loaded config from file, ManifestURL: %s", manifestURL)
-			}
-		} else {
-			if e.logger != nil {
-				e.logger.Debug("failed to load config from file: %v", err)
-			}
-			// Fallback: read .repo/config.json directly
-			manifestURL = e.readManifestURLFromConfigFile()
-		}
+// projectManifestBase 返回项目 URL 解析使用的清单仓库 URL（urljoin 基址）。
+func (e *Engine) projectManifestBase(p *project.Project) string {
+	if p != nil && p.ManifestURL != "" {
+		return p.ManifestURL
 	}
-
-	if manifestURL == "" {
-		if e.logger != nil {
-			e.logger.Error("cannot resolve relative URL: failed to get ManifestURL")
-		}
-		return ""
-	}
-
-	baseURL := trimLastPathSegment(manifestURL)
-	if baseURL == "" {
-		if e.logger != nil {
-			e.logger.Error("failed to extract baseURL from ManifestURL: %s", manifestURL)
-		}
-		return ""
-	}
-
-	if e.options.Verbose && e.logger != nil {
-		e.logger.Debug("extracted baseURL from config: %s", baseURL)
-	}
-	return baseURL
+	return e.manifestRepositoryURL()
 }
 
-// readManifestURLFromConfigFile reads the manifest_url field from .repo/config.json directly.
-func (e *Engine) readManifestURLFromConfigFile() string {
-	configPath := filepath.Join(".repo", "config.json")
-	if _, err := os.Stat(configPath); err != nil {
-		if e.logger != nil {
-			e.logger.Debug("config.json does not exist: %v", err)
-		}
-		return ""
+// resolveRelativeURL 将相对 fetch/pushurl 解析为完整项目 URL：
+// 按 urljoin 语义（config.ResolveRelativeURL）基于清单仓库 URL 解析，
+// 解析结果只拼接一次 "/<项目名>"。无法解析时返回错误，绝不静默保留相对路径。
+func (e *Engine) resolveRelativeURL(p *project.Project, rawURL, kind string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	name := ""
+	if p != nil {
+		name = p.Name
 	}
-
-	data, err := os.ReadFile(configPath)
+	resolved, err := resolveURLAgainstManifest(e.projectManifestBase(p), rawURL)
 	if err != nil {
-		if e.logger != nil {
-			e.logger.Debug("failed to read config.json: %v", err)
+		return "", fmt.Errorf("cannot resolve relative %s %q for project %s: %w", kind, rawURL, name, err)
+	}
+	// 解析后仍与原始相对值完全相同，说明清单基址未生效。
+	if resolved == rawURL && !isAbsoluteRemoteURL(resolved) {
+		return "", fmt.Errorf("cannot resolve relative %s %q for project %s", kind, rawURL, name)
+	}
+	resolved = strings.TrimSuffix(resolved, "/")
+	if name != "" {
+		resolved += "/" + strings.TrimSuffix(name, "/")
+	}
+	if e.options != nil && e.options.Verbose && e.logger != nil {
+		e.logger.Debug("resolved relative %s %s to %s", kind, rawURL, resolved)
+	}
+	return resolved, nil
+}
+
+// resolveRemoteURL 解析项目的远程 URL。
+// 绝对 URL（含 scp 风式与绝对路径）原样返回；其余相对 fetch（含非点前缀，
+// 如 "platform"）走 urljoin 解析，并只拼接一次 "/<项目名>"。解析结果为
+// 完整地址，再次调用会直接透传（幂等）。
+func (e *Engine) resolveRemoteURL(p *project.Project) (string, error) {
+	remoteURL := strings.TrimSpace(p.RemoteURL)
+	// 清单构建的项目可能已有 "解析后基址/项目名" 的相对 RemoteURL
+	// （manager 无 manifest URL 时无法解析）；优先用原始 FetchBase 重新解析，
+	// 避免把项目名再拼一次。
+	if !isAbsoluteRemoteURL(remoteURL) {
+		if fetchBase := strings.TrimSpace(p.FetchBase); fetchBase != "" {
+			if isAbsoluteRemoteURL(fetchBase) {
+				return strings.TrimSuffix(fetchBase, "/") + "/" + strings.TrimSuffix(p.Name, "/"), nil
+			}
+			remoteURL = fetchBase
 		}
+	}
+	if remoteURL == "" {
+		remoteURL = ".."
+	}
+	if isAbsoluteRemoteURL(remoteURL) {
+		return remoteURL, nil
+	}
+	return e.resolveRelativeURL(p, remoteURL, "fetch")
+}
+
+// manifestURLFromRepoDir 读取指定 .repo 元数据目录下 config.json 的 manifest_url。
+// 该值是 urljoin 的基址（清单仓库 URL），不能截断成父目录。
+func manifestURLFromRepoDir(repoDir string) string {
+	if repoDir == "" {
 		return ""
 	}
-
+	data, err := os.ReadFile(filepath.Join(repoDir, "config.json"))
+	if err != nil {
+		return ""
+	}
 	var configData struct {
 		ManifestURL string `json:"manifest_url"`
 	}
 	if err := json.Unmarshal(data, &configData); err != nil {
-		if e.logger != nil {
-			e.logger.Debug("failed to parse config.json: %v", err)
-		}
 		return ""
 	}
-
-	if configData.ManifestURL != "" && e.options.Verbose && e.logger != nil {
-		e.logger.Debug("read ManifestURL from config.json: %s", configData.ManifestURL)
-	}
-	return configData.ManifestURL
+	return strings.TrimSpace(configData.ManifestURL)
 }
 
-// resolveRelativeRemoteURL resolves a relative remote URL (.., ../, ./) against a base URL.
-func resolveRelativeRemoteURL(remoteURL, baseURL, projectName string) string {
-	baseURL = strings.TrimSuffix(baseURL, "/")
-
-	if remoteURL == ".." {
-		baseURL = trimLastPathSegment(baseURL)
-		return baseURL + "/" + projectName
+// readManifestURLFromConfigFile 从 <repoRoot>/.repo/config.json 读取 manifest_url。
+func (e *Engine) readManifestURLFromConfigFile() string {
+	repoRoot := e.repoRoot
+	if repoRoot == "" {
+		repoRoot = "."
 	}
-
-	if strings.HasPrefix(remoteURL, "../") {
-		count := 0
-		tempURL := remoteURL
-		for strings.HasPrefix(tempURL, "../") {
-			count++
-			tempURL = tempURL[3:]
-		}
-
-		tempBaseURL := baseURL
-		for i := 0; i < count; i++ {
-			tempBaseURL = trimLastPathSegment(tempBaseURL)
-		}
-
-		if tempURL == "" {
-			return tempBaseURL + "/" + projectName
-		}
-		if strings.HasSuffix(tempURL, "/") {
-			return tempBaseURL + "/" + tempURL + projectName
-		}
-		return tempBaseURL + "/" + tempURL + "/" + projectName
+	manifestURL := manifestURLFromRepoDir(filepath.Join(repoRoot, ".repo"))
+	if manifestURL != "" && e.options != nil && e.options.Verbose && e.logger != nil {
+		e.logger.Debug("read ManifestURL from config.json: %s", manifestURL)
 	}
-
-	if strings.HasPrefix(remoteURL, "./") {
-		baseURL = trimLastPathSegment(baseURL)
-		relPath := strings.TrimPrefix(remoteURL, "./")
-		if relPath == "" {
-			return baseURL + "/" + projectName
-		}
-		if strings.HasSuffix(relPath, "/") {
-			return baseURL + "/" + relPath + projectName
-		}
-		return baseURL + "/" + relPath + "/" + projectName
-	}
-
-	return remoteURL
+	return manifestURL
 }
 
-// resolveRemoteURL resolves the project's remote URL, handling relative paths
-// (.., ../, ./) by resolving against the manifest's remote URL or the config's ManifestURL.
-func (e *Engine) resolveRemoteURL(p *project.Project) string {
-	remoteURL := p.RemoteURL
-	if remoteURL == "" {
-		remoteURL = ".."
-	}
-
-	// Only process relative URLs
-	if remoteURL != ".." && !strings.HasPrefix(remoteURL, "../") && !strings.HasPrefix(remoteURL, "./") {
-		return remoteURL
-	}
-
-	// Step 1: Try to get base URL from manifest
-	baseURL, _ := e.resolveBaseURLFromManifest(p)
-
-	// Step 2: If manifest did not provide a valid protocol URL, fall back to config
-	if !strings.HasPrefix(baseURL, "ssh://") &&
-		!strings.HasPrefix(baseURL, "http://") &&
-		!strings.HasPrefix(baseURL, "https://") {
-		baseURL = e.resolveBaseURLFromConfig()
-	}
-
-	// Step 3: Resolve the relative URL against the base URL
-	if baseURL != "" {
-		remoteURL = resolveRelativeRemoteURL(remoteURL, baseURL, p.Name)
+// manifestRepositoryURL 返回清单仓库 URL（urljoin 基址）。
+// 优先使用已加载配置，其次回退到磁盘上的 .repo/config.json；
+// 该函数可能在并发 worker 中调用，只读不写 e.config（竞态）。
+func (e *Engine) manifestRepositoryURL() string {
+	if e.config != nil && e.config.ManifestURL != "" {
 		if e.options != nil && e.options.Verbose && e.logger != nil {
-			e.logger.Debug("resolved relative URL %s to %s", p.RemoteURL, remoteURL)
+			e.logger.Debug("using loaded config ManifestURL: %s", e.config.ManifestURL)
 		}
+		return e.config.ManifestURL
 	}
-
-	return remoteURL
+	if cfg, err := config.Load(); err == nil && cfg != nil && cfg.ManifestURL != "" {
+		if e.options != nil && e.options.Verbose && e.logger != nil {
+			e.logger.Debug("loaded config from file, ManifestURL: %s", cfg.ManifestURL)
+		}
+		return cfg.ManifestURL
+	} else if err != nil && e.logger != nil {
+		e.logger.Debug("failed to load config from file: %v", err)
+	}
+	return e.readManifestURLFromConfigFile()
 }
 
 // fetchProject 执行单个目的网络同
@@ -847,21 +859,28 @@ func (e *Engine) fetchProject(ctx context.Context, p *project.Project) error {
 		e.logger.Debug("正在failed to get project %s，原始远URL: %s", p.Name, p.RemoteURL)
 	}
 
-	// 1.8 --optimized-fetch：若本地已包含目标修订则跳过网络获取
-	if e.options.OptimizedFetch && p.RevisionID != "" {
-		if _, err := e.runGitInDir(p.Worktree, "cat-file", "-e", p.RevisionID); err == nil {
-			e.logger.Debug("目 %s 已包含修订 %s，跳过 fetch (optimized-fetch)", p.Name, p.RevisionID)
+	// 1.8 --optimized-fetch：仅当 manifest revision 本身形如提交 ID 且本地
+	// 已包含该对象时跳过网络获取。分支/标签的远端可能已前进，必须正常 fetch
+	// （即使超级项目覆盖写入了 RevisionID，也不能把分支当成不可变提交）。
+	if e.options.OptimizedFetch && looksLikeCommitID(p.Revision) {
+		if _, err := e.runGitInDir(projectRepoDir(p), "cat-file", "-e", p.Revision); err == nil {
+			e.logger.Debug("目 %s 已包含修订 %s，跳过 fetch (optimized-fetch)", p.Name, p.Revision)
 			return nil
 		}
 	}
 
 	// 解析远程URL
-	remoteURL := e.resolveRemoteURL(p)
+	remoteURL, err := e.resolveRemoteURL(p)
+	if err != nil {
+		return &SyncError{
+			ProjectName: p.Name,
+			Phase:       "resolve_remote_url",
+			Err:         err,
+			Timestamp:   time.Now(),
+		}
+	}
 	// Updating projectRemoteURL 为解析后URL
 	p.RemoteURL = remoteURL
-
-	// 执行 Git 操作
-	// 检查远程仓库是否存
 	if err := e.ensureRemoteExists(p, remoteURL); err != nil {
 		return &SyncError{
 			ProjectName: p.Name,
@@ -872,10 +891,10 @@ func (e *Engine) fetchProject(ctx context.Context, p *project.Project) error {
 	}
 
 	// 执行 fetch 命令
-	args := []string{"-C", p.Worktree, "fetch"}
+	args := []string{"-C", projectRepoDir(p), "fetch"}
 
-	// 检查是否为镜像模式
-	isMirror := e.options.Config != nil && e.options.Config.Mirror
+	// 检查是否为镜像模式：项目布局（p.Mirror）优先，兼容配置驱动
+	isMirror := p.Mirror || (e.options.Config != nil && e.options.Config.Mirror)
 	// 1.5 --prune 或镜像模式下添加 --prune，删除远程已不存在的引用
 	if e.options.Prune || isMirror {
 		args = append(args, "--prune")
@@ -980,7 +999,15 @@ func (e *Engine) fetchProject(ctx context.Context, p *project.Project) error {
 // ctx 取消时（fail-fast/外部取消）重试退避等待会被立即中断。
 func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 	// 解析远程URL
-	remoteURL := e.resolveRemoteURL(p)
+	remoteURL, err := e.resolveRemoteURL(p)
+	if err != nil {
+		return &SyncError{
+			ProjectName: p.Name,
+			Phase:       "resolve_remote_url",
+			Err:         err,
+			Timestamp:   time.Now(),
+		}
+	}
 	// Updating projectRemoteURL 为解析后URL
 	p.RemoteURL = remoteURL
 
@@ -992,8 +1019,17 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 		}
 	}
 
-	// 创建父目录
-	if err := os.MkdirAll(filepath.Dir(p.Worktree), 0755); err != nil {
+	// 创建父目录（镜像项目的目标是 Gitdir=<topdir>/<name>.git）
+	cloneDest := projectRepoDir(p)
+	if cloneDest == "" {
+		return &SyncError{
+			ProjectName: p.Name,
+			Phase:       "clone",
+			Err:         fmt.Errorf("project %s has no clone destination", p.Name),
+			Timestamp:   time.Now(),
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(cloneDest), 0755); err != nil {
 		return &SyncError{
 			ProjectName: p.Name,
 			Phase:       "mkdir",
@@ -1002,8 +1038,8 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 		}
 	}
 
-	// 检查是否为镜像模式
-	isMirror := e.options.Config != nil && e.options.Config.Mirror
+	// 检查是否为镜像模式：项目布局（p.Mirror）优先，兼容配置驱动
+	isMirror := p.Mirror || (e.options.Config != nil && e.options.Config.Mirror)
 
 	// 构建 clone 命令
 	args := e.buildCloneArgs(p, remoteURL, isMirror)
@@ -1012,10 +1048,41 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 	e.networkSem <- struct{}{}
 	defer func() { <-e.networkSem }()
 
-	// 1.4 添加重试机制：使用 --retry-fetches，默认 3
+	// 1.4 添加重试机制：使用 --retry-fetches（上游默认 0，即不重试）
 	maxRetries := e.fetchRetries()
+	// 记录本次运行前的目标目录状态：只有“本次运行前不存在/为空”的目录
+	// 才能在重试时安全清理；含用户数据的目录必须显式 --force-sync。
+	targetState := inspectCloneTarget(cloneDest)
+	// 运行前已存在且非空的目录：无 --force-sync 时直接拒绝，避免触碰用户数据。
+	if targetState.existed && !targetState.empty && !e.options.ForceSync && !isBareGitRepo(cloneDest) {
+		return &SyncError{
+			ProjectName: p.Name,
+			Phase:       "clone",
+			Err: fmt.Errorf(
+				"destination %s already exists; refusing to remove and re-clone without --force-sync",
+				cloneDest),
+			Timestamp: time.Now(),
+		}
+	}
 	var lastErr error
 	var stderr bytes.Buffer
+
+	// --force-sync 下运行前已存在的非空目录视为损坏/残留：必须在第一次
+	// clone（retryCount==0）前清理，否则 --retry-fetches 0 时没有任何重试
+	// 机会执行清理，force-sync 无法恢复。有效裸仓库与删除安全校验仍由
+	// cleanupIncompleteCloneState 负责。
+	cleanupBeforeFirstClone := e.options.ForceSync && targetState.existed && !targetState.empty
+	if cleanupBeforeFirstClone {
+		if cleanupErr := e.cleanupIncompleteCloneState(p, targetState); cleanupErr != nil {
+			return &SyncError{
+				ProjectName: p.Name,
+				Phase:       "clone",
+				Err:         cleanupErr,
+				Timestamp:   time.Now(),
+				RetryCount:  0,
+			}
+		}
+	}
 
 	for retryCount := 0; retryCount <= maxRetries; retryCount++ {
 		if retryCount > 0 {
@@ -1037,116 +1104,15 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 
 			stderr.Reset()
 
-			// 检查目标目录是否已存在但不完整，如果存在则删除
-			if _, err := os.Stat(p.Worktree); err == nil {
-				// 安全护栏：目标目录已是有效的裸仓库（HEAD/objects/refs 齐全）时，
-				// 说明它是已存在的完整镜像而非本次克隆残留，绝不删除，直接终止重试。
-				// 注意：非镜像模式下克隆失败残留的是含 .git 子目录的工作树（顶层无 HEAD），
-				// 不受此护栏影响，仍可正常清理重克隆。
-				if isBareGitRepo(p.Worktree) {
-					e.logger.Warn(
-						"target %s already exists and is a valid bare repository, refusing to remove and re-clone",
-						p.Worktree)
-					return &SyncError{
-						ProjectName: p.Name,
-						Phase:       "clone",
-						Err: fmt.Errorf(
-							"destination %s already exists and is a valid bare repository, refusing to delete",
-							p.Worktree),
-						Timestamp:  time.Now(),
-						RetryCount: retryCount,
-					}
-				}
-
-				// 在镜像模式下，检查目路径是否在.repo目录下
-				if isMirror {
-					// 对于镜像模式，目路径是根据远程URL确定的，可能不在.repo目录下
-					// 我们只需要确保路径是安全的，不删除系统目录
-					absWorktree, absErr := filepath.Abs(p.Worktree)
-					if absErr != nil {
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("无法获取working directory绝对路径: %w", absErr),
-						}
-					}
-
-					// 获取当前working directory
-					currentDir, dirErr := os.Getwd()
-					if dirErr != nil {
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("failed to get current directory: %w", dirErr),
-						}
-					}
-
-					// 绝对禁止删除系统关键目录
-					// 检查是否为危险路径
-					if p.Worktree == "." || p.Worktree == ".." ||
-						strings.HasPrefix(p.Worktree, "../") || strings.HasPrefix(p.Worktree, "..\\") ||
-						absWorktree == "/" || absWorktree == "\\" ||
-						filepath.VolumeName(absWorktree) == absWorktree { // Windows根目录
-						// 路径绝对不安全，deletion refused
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("working directory %s is a system critical directory, deletion is forbidden", p.Worktree),
-						}
-					}
-
-					// 检查路径是否在.repo目录下或当前目录下
-					// 只有在这两个目录下的路径才允许删除
-					// 特殊处理：如果路径是.repo目录本身或其子目录，则允许删除
-					inRepoDir := strings.HasPrefix(absWorktree, e.repoRoot)
-					inCurrentDir := strings.HasPrefix(absWorktree, currentDir)
-					isRepoSubDir := absWorktree == e.repoRoot || strings.HasPrefix(absWorktree, e.repoRoot+string(filepath.Separator))
-
-					if !inRepoDir && !inCurrentDir && !isRepoSubDir {
-						// 路径is not within allowed range，deletion refused
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("working directory %s is not within allowed range（.repo目录或当前目录），deletion refused", p.Worktree),
-						}
-					}
-				} else {
-					// 非镜像模式下，保持原有的安全检查
-					// 安全检查：确保要删除的目录在repo根目录下
-					repoRoot, repoErr := config.GetRepoRoot()
-					if repoErr != nil {
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("failed to get repo root: %w", repoErr),
-						}
-					}
-
-					// 检查working directory是否在repo根目录下
-					absWorktree, absErr := filepath.Abs(p.Worktree)
-					if absErr != nil {
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("无法获取working directory绝对路径: %w", absErr),
-						}
-					}
-
-					relPath, relErr := filepath.Rel(repoRoot, absWorktree)
-					if relErr != nil || strings.HasPrefix(relPath, "..") {
-						// 目录is not under repo root，deletion refused
-						return &SyncError{
-							ProjectName: p.Name,
-							Phase:       "clone",
-							Err:         fmt.Errorf("working directory %s is not under repo root，deletion refused", p.Worktree),
-						}
-					}
-				}
-
-				e.logger.Info("removing incomplete clone directory: %s", p.Worktree)
-				if err := os.RemoveAll(p.Worktree); err != nil {
-					e.logger.Warn("failed to remove incomplete clone directory %s: %v", p.Worktree, err)
-					// Continue anyway: the clone command may handle the existing directory
+			// 清理上次克隆残留：本次运行前为空/不存在的目录可直接清理，
+			// 含用户数据的目录仅在 --force-sync 下允许。
+			if cleanupErr := e.cleanupIncompleteCloneState(p, targetState); cleanupErr != nil {
+				return &SyncError{
+					ProjectName: p.Name,
+					Phase:       "clone",
+					Err:         cleanupErr,
+					Timestamp:   time.Now(),
+					RetryCount:  retryCount,
 				}
 			}
 		}
@@ -1158,6 +1124,27 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 
 		if lastErr == nil {
 			// 成功克隆，跳出重试循环
+			break
+		}
+
+		// ctx 在 clone 执行期间被取消（fail-fast/外部取消）：立即返回，
+		// 并保留 ctx 语义供 errors.Is 检测。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return &SyncError{
+				ProjectName: p.Name,
+				Phase:       "clone",
+				Err:         fmt.Errorf("clone canceled (last error: %w): %w", lastErr, ctxErr),
+				Output:      stderr.String(),
+				Timestamp:   time.Now(),
+				RetryCount:  retryCount,
+			}
+		}
+
+		// git clone 在 checkout 阶段失败时会留下可用的 .git（对象已下载）。
+		// 若目录是本次运行新建/原本为空，尝试恢复工作树而不是直接放弃。
+		if !isMirror && e.canReuseCloneTarget(targetState) && e.recoverIncompleteCloneCheckout(p) {
+			e.logger.Warn("clone for project %s failed during checkout; recovered existing repository", p.Name)
+			lastErr = nil
 			break
 		}
 
@@ -1228,12 +1215,13 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 		}
 		e.logger.Info("成功处理目 %s 的链接文件和复制文件", p.Name)
 
-		// 处理 submodule（如果启用）
+		// 处理 submodule（如果启用）：失败必须计入项目失败，不能只打日志。
 		if err := e.updateSubmodules(ctx, p); err != nil {
-			e.logger.Error("目 %s 更新 submodule failed: %v", p.Name, err)
-			// submodule 更新failed不阻断整个同步流程，只记录错误
-			if !e.options.Quiet {
-				e.logger.Warn("跳过目 %s 的 submodule 更新", p.Name)
+			return &SyncError{
+				ProjectName: p.Name,
+				Phase:       "submodule_update",
+				Err:         err,
+				Timestamp:   time.Now(),
 			}
 		}
 	} else if isMirror {
@@ -1245,15 +1233,117 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 	return nil
 }
 
+// cloneTargetState 记录一次 clone 开始前的目标目录状态。
+// 仅用于判断重试时能否安全清理残留，不会在运行中更新。
+type cloneTargetState struct {
+	existed bool
+	empty   bool
+}
+
+// inspectCloneTarget 探测目标目录在本次运行前的状态。
+func inspectCloneTarget(worktree string) cloneTargetState {
+	entries, err := os.ReadDir(worktree)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cloneTargetState{existed: false}
+		}
+		// 无法读取时保守视为非空已存在目录，避免误删。
+		return cloneTargetState{existed: true, empty: false}
+	}
+	return cloneTargetState{existed: true, empty: len(entries) == 0}
+}
+
+// canReuseCloneTarget 判断目标目录是否由本次运行创建/原本为空，
+// 因而其内容可视为克隆残留（而非用户数据）。--force-sync 时允许回收任意目录。
+func (e *Engine) canReuseCloneTarget(state cloneTargetState) bool {
+	return e.options.ForceSync || !state.existed || state.empty
+}
+
+// cleanupIncompleteClone 在克隆重试前处理已存在的目标目录。
+// 直接调用时以当前目录状态判定（空目录可清理，非空目录需 --force-sync）；
+// cloneProject 使用 cleanupIncompleteCloneState 传入真实的运行前状态，
+// 以便清理本次克隆写入的残留。
+// 完整裸仓库不是克隆残留，永不删除；删除前经 IsSafeToDelete 容器校验。
+func (e *Engine) cleanupIncompleteClone(p *project.Project) error {
+	return e.cleanupIncompleteCloneState(p, inspectCloneTarget(projectRepoDir(p)))
+}
+
+// cleanupIncompleteCloneState 依据运行前状态清理克隆目标。
+//   - 本次运行前不存在/为空的目录：可直接删除重试（不丢用户数据）；
+//   - 本次运行前已存在且非空：必须显式 --force-sync，否则拒绝；
+//   - 有效裸仓库永不删除。
+func (e *Engine) cleanupIncompleteCloneState(p *project.Project, state cloneTargetState) error {
+	dest := projectRepoDir(p)
+	if _, statErr := os.Stat(dest); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect clone destination %s: %w", dest, statErr)
+	}
+
+	if !e.canReuseCloneTarget(state) {
+		return fmt.Errorf(
+			"destination %s already exists; refusing to remove and re-clone without --force-sync",
+			dest)
+	}
+
+	if isBareGitRepo(dest) {
+		e.logger.Warn(
+			"target %s already exists and is a valid bare repository, refusing to remove and re-clone",
+			dest)
+		return fmt.Errorf(
+			"destination %s already exists and is a valid bare repository, refusing to delete",
+			dest)
+	}
+
+	// 容器安全检查：filepath.Rel + 分隔符感知，禁止删除 repo 根目录
+	// 本身及其兄弟目录（HasPrefix 误判）。
+	if safeErr := IsSafeToDelete(dest, e.repoRoot); safeErr != nil {
+		return fmt.Errorf("refusing to remove %s: %w", dest, safeErr)
+	}
+
+	e.logger.Info("removing incomplete clone directory: %s", dest)
+	if err := os.RemoveAll(dest); err != nil {
+		return fmt.Errorf("failed to remove incomplete clone directory %s: %w", dest, err)
+	}
+	return nil
+}
+
+// recoverIncompleteCloneCheckout 尝试修复 clone 在 checkout 阶段失败后留下的
+// 可用仓库（对象已下载、HEAD 已设置）。成功时工作树被 reset 到 HEAD。
+// 返回 false 表示无法安全恢复（例如 .git 缺失或 HEAD 不可解析）。
+func (e *Engine) recoverIncompleteCloneCheckout(p *project.Project) bool {
+	gitDir := filepath.Join(projectRepoDir(p), ".git")
+	if _, err := os.Stat(gitDir); err != nil {
+		if isBareGitRepo(p.Worktree) {
+			gitDir = p.Worktree
+		} else {
+			return false
+		}
+	}
+	if !isGitRepoDir(gitDir) {
+		return false
+	}
+
+	if _, err := e.runGitInDir(projectRepoDir(p), "rev-parse", "--verify", "HEAD"); err != nil {
+		// HEAD 尚未建立（clone 在早期失败），无法安全恢复。
+		return false
+	}
+
+	if _, err := e.runGitInDir(projectRepoDir(p), "reset", "--hard", "HEAD"); err != nil {
+		e.logger.Debug("failed to recover checkout for project %s: %v", p.Name, err)
+		return false
+	}
+	return true
+}
+
 // buildCloneArgs 构造 git clone 参数（不含执行），便于对参数构造做单元测试。
 // isMirror 由调用方根据配置判定并用于跳过分支参数。
 func (e *Engine) buildCloneArgs(p *project.Project, remoteURL string, isMirror bool) []string {
 	args := []string{"clone"}
 
-	// 1.5 --no-clone-bundle：禁用 HTTP/HTTPS 上的 /clone.bundle 加速
-	if e.options.NoCloneBundle {
-		args = append(args, "--no-clone-bundle")
-	}
+	// --no-clone-bundle：repo-go 不实现 /clone.bundle 下载，保持 no-op，
+	// 绝不能把该选项透传给 git clone（git 会因未知选项直接失败）。
 
 	// 添加 --origin 参数，指定远程名称
 	args = append(args, "--origin", p.RemoteName)
@@ -1306,6 +1396,13 @@ func (e *Engine) buildCloneArgs(p *project.Project, remoteURL string, isMirror b
 		args = append(args, fmt.Sprintf("--depth=%d", p.CloneDepth))
 	}
 
+	// --network-only 只获取对象、不落工作树：非镜像克隆追加 --no-checkout，
+	// 克隆后的 checkout/linkfile/copyfile/submodule 也全部跳过。
+	// 镜像克隆本身产物就是裸仓库，无需该参数。
+	if e.options.NetworkOnly && !isMirror {
+		args = append(args, "--no-checkout")
+	}
+
 	if e.options.Quiet {
 		args = append(args, "--quiet")
 	}
@@ -1335,7 +1432,7 @@ func (e *Engine) buildCloneArgs(p *project.Project, remoteURL string, isMirror b
 	}
 
 	// 添加远程URL和目标目录
-	args = append(args, remoteURL, p.Worktree)
+	args = append(args, remoteURL, projectRepoDir(p))
 
 	return args
 }
@@ -1344,10 +1441,15 @@ func (e *Engine) buildCloneArgs(p *project.Project, remoteURL string, isMirror b
 //  1. 先把 revision 解析为具体提交 SHA(GetRevisionId 语义),解析失败报
 //     "revision X in Y not found";绝不把分支名直接传给 git checkout——
 //     工作树内存在同名文件时 git 会报引用/路径歧义(如 toolchain/gcc 项目)
-//  2. HEAD 已指向 revid:不执行任何 git 命令直接返回(上游:No changes)
-//  3. --detach 或游离 HEAD:checkout --force --detach <revid> --(上游 _Checkout)
+//  2. HEAD 已指向 revid:默认不执行任何 git 命令(上游:No changes);
+//     但显式 --detach 且当前仍附着分支时,仍需 checkout --detach
+//  3. --detach 或游离 HEAD:checkout [--force] --detach <revid> --(上游 _Checkout);
+//     --force 仅在 --force-sync/--force-overwrite 时追加
+//     3.5 进入分支语义前先补齐空工作树（sync -n 遗留的 index/工作树为空），
+//     否则 merge --ff-only 会因“tracked 文件被删除”失败；只填充当前 HEAD，
+//     不移动分支，已有 tracked 内容时拒绝 reset。
 //  4. 在 revision 分支上(或当前分支跟踪该 revision):merge --ff-only 快进
-//     (上游 _FastForward);分叉时保留本地状态仅告警,不自动 rebase/reset-hard
+//     (上游 _FastForward);失败返回错误(项目计为失败,提示人工处理),不自动 rebase/reset-hard
 //  5. 其他:本地存在同名分支则切换过去再快进,否则 detach 到 revid
 //
 // ctx 取消时（fail-fast/外部取消）重试退避等待会被立即中断。
@@ -1362,8 +1464,33 @@ func (e *Engine) checkoutProject(ctx context.Context, p *project.Project) error 
 		}
 	}
 
-	// 已就位:与上游一致直接返回,不执行任何 checkout
-	if e.gitHeadSha(p) == revid {
+	// 解析当前 HEAD 状态，供"已就位"与 detach 判定共用
+	headSha := e.gitHeadSha(p)
+	headBranch := e.gitHeadBranch(p)
+
+	// 空工作树补齐必须发生在进入 switch 之前：`repo sync -n` 留下空 index/
+	// 工作树，其后远端前进时 HEAD 仍指向旧提交，直接 merge --ff-only 会因
+	// 所有 tracked 文件“被删除”而失败。以当前 HEAD 补齐（不移动分支），
+	// 保留后续 ff/detach 语义；已有 tracked 内容的目录不会被 reset。
+	if headSha != "" {
+		if err := e.ensureWorktreePopulated(ctx, p, headSha); err != nil {
+			return &SyncError{
+				ProjectName: p.Name,
+				Phase:       "checkout",
+				Err:         err,
+				Timestamp:   time.Now(),
+			}
+		}
+	}
+
+	// 已就位：默认不执行任何 checkout；但 --detach 明确要求游离 HEAD 时，
+	// 若当前仍附着在分支上，仍需 checkout --detach 把 HEAD 分离。
+	if headSha == revid {
+		if e.options.Detach && headBranch != "" {
+			e.checkoutSem <- struct{}{}
+			defer func() { <-e.checkoutSem }()
+			return e.checkoutRevision(ctx, p, revid, true)
+		}
 		return nil
 	}
 
@@ -1372,7 +1499,6 @@ func (e *Engine) checkoutProject(ctx context.Context, p *project.Project) error 
 	defer func() { <-e.checkoutSem }()
 
 	branch := revisionBranchName(p.Revision)
-	headBranch := e.gitHeadBranch(p)
 
 	switch {
 	case e.options.Detach || headBranch == "":
@@ -1396,6 +1522,111 @@ func (e *Engine) checkoutProject(ctx context.Context, p *project.Project) error 
 	}
 }
 
+// ensureWorktreePopulated 修复“HEAD 已指向目标提交但工作树/index 为空”的状态。
+// 典型来源：--network-only 的 git clone --no-checkout，或 clone 在 checkout
+// 阶段失败后重试复用残留仓库。
+//
+// 安全约束：
+//  1. 裸仓库（含镜像）没有工作树，直接返回 nil——在裸仓库执行 reset --hard
+//     会失败，且绝不能借“补检出”之名改写引用；
+//  2. 只有确认工作树确实没有 HEAD tree 内容（ls-tree 路径全部 Lstat 不存在，
+//     且 status 无工作树列改动）才执行 `git reset --hard <revid>`，
+//     避免 index 丢失但文件仍在时覆盖用户改动。
+func (e *Engine) ensureWorktreePopulated(ctx context.Context, p *project.Project, revid string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	repoDir := projectRepoDir(p)
+	if repoDir == "" {
+		return nil
+	}
+
+	// 裸仓库/镜像项目：没有工作树，不能 reset --hard。
+	if p.Mirror || isBareGitRepo(repoDir) {
+		return nil
+	}
+
+	// 再确认 git 认为当前目录是工作树（兼容 submodule/.git 文件等布局）。
+	insideWorkTree, err := e.runGitInDir(repoDir, "rev-parse", "--is-inside-work-tree")
+	if err != nil || strings.TrimSpace(string(insideWorkTree)) != "true" {
+		return nil
+	}
+
+	// index 非空说明工作树已有内容，不做任何处理。
+	indexFiles, err := e.runGitInDir(repoDir, "ls-files", "-z")
+	if err != nil {
+		return nil
+	}
+	if len(indexFiles) > 0 {
+		return nil
+	}
+
+	// HEAD tree 为空（如空仓库）时无需检出。
+	treeFiles, err := e.runGitInDir(repoDir, "ls-tree", "-r", "--name-only", "-z", "HEAD")
+	if err != nil || len(bytes.TrimSpace(treeFiles)) == 0 {
+		return nil
+	}
+
+	// 工作树中只要有任一 HEAD tree 路径存在，就说明内容尚在，
+	// reset --hard 可能覆盖用户改动，必须放弃。
+	hasContent, err := worktreeHasTrackedContent(repoDir, treeFiles)
+	if err != nil {
+		return err
+	}
+	if hasContent {
+		return nil
+	}
+
+	// 进一步确认 status 没有工作树列（Y）改动。index 为空时出现
+	// “D  path”（X=D、Y=空格）是正常的，不能据此阻止补检出。
+	if statusOut, statusErr := e.runGitInDir(repoDir, "status", "--porcelain", "--untracked-files=no"); statusErr == nil {
+		if statusHasWorktreeChanges(statusOut) {
+			return nil
+		}
+	}
+
+	if _, err := e.runGitInDir(repoDir, "reset", "--hard", revid); err != nil {
+		return fmt.Errorf("failed to populate empty worktree for %s: %w", p.Name, err)
+	}
+	return nil
+}
+
+// worktreeHasTrackedContent 判断 HEAD tree 中的路径是否至少有一个存在于工作树。
+// 返回 false 表示工作树确实没有 HEAD tree 内容（可安全补检出）。
+// 无法确认（Lstat 非 IsNotExist 错误）时保守返回 true。
+func worktreeHasTrackedContent(repoDir string, treeFiles []byte) (bool, error) {
+	paths := bytes.Split(bytes.TrimRight(treeFiles, "\x00"), []byte{0})
+	for _, rel := range paths {
+		if len(rel) == 0 {
+			continue
+		}
+		if _, statErr := os.Lstat(filepath.Join(repoDir, string(rel))); statErr == nil {
+			return true, nil
+		} else if !os.IsNotExist(statErr) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// statusHasWorktreeChanges 判断 porcelain status 输出是否存在工作树列（Y）改动。
+// 输出格式为 "XY <path>"：X=index、Y=worktree；只检查 Y 列，
+// 避免 index 为空时的 “D ” 记录阻止补检出。
+func statusHasWorktreeChanges(statusOut []byte) bool {
+	for _, line := range strings.Split(string(statusOut), "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		if y := line[1]; y != ' ' && y != '?' {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveRevisionID 将 manifest revision 解析为具体提交 SHA(对齐上游 GetRevisionId):
 //   - 提交 ID:直接解析验证
 //   - 分支名(或 refs/heads/<branch>):优先 refs/remotes/<remote>/<branch>
@@ -1406,6 +1637,13 @@ func (e *Engine) checkoutProject(ctx context.Context, p *project.Project) error 
 // 全部失败时返回上游同款错误文本 "revision <rev> in <name> not found"。
 // 注意:与上游一致,不带前缀的 revision 只按分支解析,不回退到同名 tag。
 func (e *Engine) resolveRevisionID(p *project.Project) (string, error) {
+	// 超级项目覆盖：RevisionID 为完整 SHA 时优先使用它（对齐上游
+	// GetRevisionId 中 revisionId 覆盖 revisionExpr 的语义），使
+	// --use-superproject 写入的提交真正生效。
+	if revisionID := strings.TrimSpace(p.RevisionID); isFullCommitID(revisionID) {
+		return revisionID, nil
+	}
+
 	rev := p.Revision
 	if rev == "" {
 		return "", fmt.Errorf("revision in %s not found", p.Name)
@@ -1425,7 +1663,7 @@ func (e *Engine) resolveRevisionID(p *project.Project) (string, error) {
 	}
 
 	for _, ref := range candidates {
-		out, err := e.runGitInDir(p.Worktree, "rev-parse", "--verify", "--quiet", ref+"^0")
+		out, err := e.runGitInDir(projectRepoDir(p), "rev-parse", "--verify", "--quiet", ref+"^0")
 		if err != nil {
 			continue
 		}
@@ -1457,7 +1695,7 @@ func remoteTrackingRef(remoteName, branch string) string {
 
 // gitHeadSha 返回 HEAD 指向的提交 SHA; unborn 分支或仓库异常时为空。
 func (e *Engine) gitHeadSha(p *project.Project) string {
-	out, err := e.runGitInDir(p.Worktree, "rev-parse", "--verify", "--quiet", "HEAD")
+	out, err := e.runGitInDir(projectRepoDir(p), "rev-parse", "--verify", "--quiet", "HEAD")
 	if err != nil {
 		return ""
 	}
@@ -1466,7 +1704,7 @@ func (e *Engine) gitHeadSha(p *project.Project) string {
 
 // gitHeadBranch 返回 HEAD 的分支引用全名(如 refs/heads/master);游离 HEAD 时为空。
 func (e *Engine) gitHeadBranch(p *project.Project) string {
-	out, err := e.runGitInDir(p.Worktree, "symbolic-ref", "-q", "HEAD")
+	out, err := e.runGitInDir(projectRepoDir(p), "symbolic-ref", "-q", "HEAD")
 	if err != nil {
 		return ""
 	}
@@ -1501,7 +1739,7 @@ func (e *Engine) branchTracksRevision(p *project.Project, headBranch string) boo
 
 // gitConfigGet 读取 worktree 级 git 配置,缺失或读取失败时为空。
 func (e *Engine) gitConfigGet(p *project.Project, key string) string {
-	out, err := e.runGitInDir(p.Worktree, "config", "--get", key)
+	out, err := e.runGitInDir(projectRepoDir(p), "config", "--get", key)
 	if err != nil {
 		return ""
 	}
@@ -1513,38 +1751,42 @@ func (e *Engine) localBranchExists(p *project.Project, branch string) bool {
 	if branch == "" {
 		return false
 	}
-	_, err := e.runGitInDir(p.Worktree, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	_, err := e.runGitInDir(projectRepoDir(p), "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
 	return err == nil
 }
 
 // fastForwardTo 将当前分支快进到 revid(上游 _FastForward)。
-// 无法快进(本地与上游分叉)时不失败:与上游"全部本地提交均为本人且无
-// 上游增益"分支等价,保留本地状态仅记录告警;上游的分叉 rebase/reset-hard
-// 分支 repo-go 不自动执行,避免破坏用户提交。
+// --ff-only 失败时返回带 stderr 的错误(项目计为失败)，绝不返回 nil 冒充成功；
+// 与上游一致不做 rebase/reset --hard，避免破坏用户本地提交。
 func (e *Engine) fastForwardTo(p *project.Project, revid string) error {
-	args := []string{"-C", p.Worktree, "merge", "--no-stat", "--ff-only", revid}
+	args := []string{"-C", projectRepoDir(p), "merge", "--no-stat", "--ff-only", revid}
 	_, stderrStr, err := e.runGitWithStderr(args)
 	if err != nil {
-		e.logger.Warn("project %s 无法快进到 %s,保留本地状态: %v%s",
-			p.Name, revid, err, stderrStr)
+		return &SyncError{
+			ProjectName: p.Name,
+			Phase:       "checkout",
+			Err:         fmt.Errorf("merge --ff-only %s failed: %w", revid, err),
+			Output:      stderrStr,
+			Timestamp:   time.Now(),
+		}
 	}
 	return nil
 }
 
-// checkoutRevision 执行 git checkout,带重试;最后一次重试追加 --force。
+// checkoutRevision 执行 git checkout,带重试。
+// 仅当显式 --force-sync/--force-overwrite 时才追加 --force；普通重试绝不在
+// 最后一轮偷偷强制覆盖脏工作树，重试耗尽即返回错误。
 // target 为提交 SHA 或本地分支名;结尾的 "--" 防止同名文件触发路径歧义(上游同款)。
 // ctx 取消时重试退避等待会被立即中断。
 func (e *Engine) checkoutRevision(ctx context.Context, p *project.Project, target string, detach bool) error {
-	buildArgs := func(force bool) []string {
-		args := []string{"-C", p.Worktree, "checkout"}
-		if e.options.ForceOverwrite || force {
-			args = append(args, "--force")
-		}
-		if detach {
-			args = append(args, "--detach")
-		}
-		return append(args, target, "--")
+	args := []string{"-C", projectRepoDir(p), "checkout"}
+	if e.options.ForceSync || e.options.ForceOverwrite {
+		args = append(args, "--force")
 	}
+	if detach {
+		args = append(args, "--detach")
+	}
+	args = append(args, target, "--")
 
 	// Checkout retries (non-network, use lower limit)
 	maxRetries := 2
@@ -1568,14 +1810,9 @@ func (e *Engine) checkoutRevision(ctx context.Context, p *project.Project, targe
 			e.logger.Info("retrying checkout for project %s revision %s (attempt %d)",
 				p.Name, target, retryCount)
 			stderrBuf.Reset()
-
-			// On last attempt, try force checkout
-			if retryCount == maxRetries {
-				e.logger.Info("attempting force checkout for project %s", p.Name)
-			}
 		}
 
-		_, stderrStr, runErr := e.runGitWithStderr(buildArgs(retryCount == maxRetries))
+		_, stderrStr, runErr := e.runGitWithStderr(args)
 		stderrBuf.WriteString(stderrStr)
 		lastErr = runErr
 
@@ -1597,19 +1834,35 @@ func (e *Engine) checkoutRevision(ctx context.Context, p *project.Project, targe
 	return nil
 }
 
-// looksLikeCommitID 判断 revision 是否形如提交 ID(7-40 位十六进制)。
-// clone 的 --branch 参数与 fetch/checkout 的 revision 解析共用此判定。
+// looksLikeCommitID 判断 revision 是否为不可变提交 ID（40 位 SHA-1 或
+// 64 位 SHA-256，小写十六进制）。与 isCommitHash 共用同一判定：只有完整
+// 提交 ID 才视为不可变对象；7-40 位十六进制字符串仍可能是合法分支名
+// （如 "deadbeef"），必须按分支解析（refs/remotes → refs/heads）。
 func looksLikeCommitID(rev string) bool {
-	if len(rev) < 7 || len(rev) > 40 {
+	return isCommitHash(rev)
+}
+
+// isCommitHash 判断字符串是否为完整的提交 ID：40 位 SHA-1 或 64 位 SHA-256。
+// 只接受小写十六进制（git 输出的对象名形式）；大写或短 SHA 均按分支/引用处理。
+// 用于识别 -b 指定的不可变提交（不得回退到默认分支）以及超级项目 RevisionID。
+func isCommitHash(rev string) bool {
+	rev = strings.TrimSpace(rev)
+	if len(rev) != 40 && len(rev) != 64 {
 		return false
 	}
 	for _, c := range rev {
-		// 德摩根变换：非十六进制字符即失败（数字/小写/大写三段均不命中）
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
 	return true
+}
+
+// isFullCommitID 判断字符串是否为完整提交 ID（40 位 SHA-1 或 64 位 SHA-256）。
+// 用于识别超级项目覆盖写入的 RevisionID（仅完整 SHA 可信，
+// Project.RevisionID 在普通构造时可能保存分支名）。
+func isFullCommitID(rev string) bool {
+	return isCommitHash(rev)
 }
 
 // revisionFetchRefspec 构造 fetch 阶段的精确 revision refspec(对齐上游
@@ -1633,16 +1886,36 @@ func revisionFetchRefspec(p *project.Project) string {
 	return fmt.Sprintf("+%s:%s", rev, rev)
 }
 
+// projectRepoDir 返回项目实际的 git 仓库目录：
+//   - 镜像项目没有工作树，仓库目录为 Gitdir（= Objdir = <topdir>/<name>.git）；
+//   - 普通项目为工作树目录。
+func projectRepoDir(p *project.Project) string {
+	if p == nil {
+		return ""
+	}
+	if p.Mirror {
+		if p.Gitdir != "" {
+			return p.Gitdir
+		}
+		return p.Objdir
+	}
+	return p.Worktree
+}
+
 // projectExists 检查目目录是否存
 // 兼容两种布局：
 //   - 标准工作树：worktree/.git 目录
-//   - 裸仓库/镜像：worktree 本身即 git 目录（HEAD/objects/refs 在顶层，无 .git 子目录）
+//   - 裸仓库/镜像：仓库目录本身即 git 目录（HEAD/objects/refs 在顶层，无 .git 子目录）
 func (e *Engine) projectExists(p *project.Project) (bool, error) {
-	gitDir := filepath.Join(p.Worktree, ".git")
+	repoDir := projectRepoDir(p)
+	if p.Mirror {
+		return isBareGitRepo(repoDir), nil
+	}
+	gitDir := filepath.Join(repoDir, ".git")
 	_, err := os.Stat(gitDir)
 	if os.IsNotExist(err) {
 		// 无 .git 子目录：检查是否为裸仓库（mirror 模式克隆产物）
-		if isBareGitRepo(p.Worktree) {
+		if isBareGitRepo(repoDir) {
 			return true, nil
 		}
 		return false, nil
@@ -1710,7 +1983,7 @@ func isBareGitRepo(dir string) bool {
 // setupRemote ensures the project's git remote exists with the correct URL and mirror config.
 // It handles both fresh clone (add remote) and existing repo (verify/update URL) scenarios.
 func (e *Engine) setupRemote(p *project.Project, remoteURL string) error {
-	output, err := e.runGitInDir(p.Worktree, "remote")
+	output, err := e.runGitInDir(projectRepoDir(p), "remote")
 	if err != nil {
 		return fmt.Errorf("failed to list remotes: %w", err)
 	}
@@ -1737,14 +2010,14 @@ func (e *Engine) setupRemote(p *project.Project, remoteURL string) error {
 			e.logger.Debug("project %s has default remote 'origin' but project specifies '%s', removing 'origin'",
 				p.Name, p.RemoteName)
 		}
-		if _, err := e.runGitInDir(p.Worktree, "remote", "remove", "origin"); err != nil {
+		if _, err := e.runGitInDir(projectRepoDir(p), "remote", "remove", "origin"); err != nil {
 			e.logger.Warn("failed to remove 'origin' remote for project %s: %v", p.Name, err)
 		}
 	}
 
 	if !remoteExists {
 		// Remote does not exist, add it
-		if _, err := e.runGitInDir(p.Worktree, "remote", "add", p.RemoteName, remoteURL); err != nil {
+		if _, err := e.runGitInDir(projectRepoDir(p), "remote", "add", p.RemoteName, remoteURL); err != nil {
 			return fmt.Errorf("failed to add remote: %w", err)
 		}
 		if e.options.Verbose {
@@ -1752,13 +2025,13 @@ func (e *Engine) setupRemote(p *project.Project, remoteURL string) error {
 		}
 	} else {
 		// Remote exists, check if URL needs updating
-		urlOutput, err := e.runGitInDir(p.Worktree, "remote", "get-url", p.RemoteName)
+		urlOutput, err := e.runGitInDir(projectRepoDir(p), "remote", "get-url", p.RemoteName)
 		if err != nil {
 			return fmt.Errorf("failed to get remote URL: %w", err)
 		}
 		currentURL := strings.TrimSpace(string(urlOutput))
 		if currentURL != remoteURL {
-			if _, err := e.runGitInDir(p.Worktree, "remote", "set-url", p.RemoteName, remoteURL); err != nil {
+			if _, err := e.runGitInDir(projectRepoDir(p), "remote", "set-url", p.RemoteName, remoteURL); err != nil {
 				return fmt.Errorf("failed to update remote URL: %w", err)
 			}
 			if e.options.Verbose {
@@ -1767,14 +2040,36 @@ func (e *Engine) setupRemote(p *project.Project, remoteURL string) error {
 		}
 	}
 
-	// Set mirror mode if applicable
-	if e.options.Config != nil && e.options.Config.Mirror {
-		if _, err := e.runGitInDir(
-			p.Worktree,
-			"config", "--add",
-			fmt.Sprintf("remote.%s.mirror", p.RemoteName),
-			"true",
-		); err != nil {
+	// pushurl 只取清单 remote 的 pushurl 基址，无条件拼接 "/<项目名>"
+	// （对齐上游 GitConfig.Remote.Save）；review 单独写入 remote.<name>.review，
+	// 绝不冒用为 pushurl。字段消失时必须 unset-all，避免残留旧地址。
+	pushURL, pushErr := e.projectPushURL(p)
+	if pushErr != nil {
+		return pushErr
+	}
+	repoDir := projectRepoDir(p)
+	if err := e.setOrUnsetGitConfig(repoDir,
+		fmt.Sprintf("remote.%s.pushurl", p.RemoteName), pushURL); err != nil {
+		return err
+	}
+	if e.options.Verbose && pushURL != "" {
+		e.logger.Debug("set pushurl for project %s remote %s: %s", p.Name, p.RemoteName, pushURL)
+	}
+
+	reviewURL := e.projectReviewURL(p)
+	if err := e.setOrUnsetGitConfig(repoDir,
+		fmt.Sprintf("remote.%s.review", p.RemoteName), reviewURL); err != nil {
+		return err
+	}
+	if e.options.Verbose && reviewURL != "" {
+		e.logger.Debug("set review for project %s remote %s: %s", p.Name, p.RemoteName, reviewURL)
+	}
+
+	// mirror 用 set（替换）而不是 --add，避免重复执行后同一 key 累积多值。
+	isMirror := p.Mirror || (e.options.Config != nil && e.options.Config.Mirror)
+	if isMirror {
+		if _, err := e.runGitInDir(repoDir,
+			"config", "--replace-all", fmt.Sprintf("remote.%s.mirror", p.RemoteName), "true"); err != nil {
 			return fmt.Errorf("failed to set mirror config: %w", err)
 		}
 		if e.options.Verbose {
@@ -1783,6 +2078,71 @@ func (e *Engine) setupRemote(p *project.Project, remoteURL string) error {
 	}
 
 	return nil
+}
+
+// setOrUnsetGitConfig 写入或清除单个 git config key（对齐上游 Remote.Save：
+// value 为 None 时删除）。--unset-all 清理多值残留；key 本就不存在（exit 5）
+// 视为成功。
+func (e *Engine) setOrUnsetGitConfig(repoDir, key, value string) error {
+	if value != "" {
+		if _, err := e.runGitInDir(repoDir, "config", "--replace-all", key, value); err != nil {
+			return fmt.Errorf("failed to set %s: %w", key, err)
+		}
+		return nil
+	}
+	if _, err := e.runGitInDir(repoDir, "config", "--unset-all", key); err != nil {
+		var gitErr *git.GitCommandError
+		if errors.As(err, &gitErr) && gitErr.ExitCode == 5 {
+			return nil
+		}
+		return fmt.Errorf("failed to unset %s: %w", key, err)
+	}
+	return nil
+}
+
+// projectPushURL 返回应写入 remote.<name>.pushurl 的完整 URL：
+// 只取清单 remote 的显式 pushurl；基址无条件拼接 "/<项目名>"
+// （对齐上游 pushUrl + "/" + projectname）。未配置时返回空字符串（调用方 unset）。
+func (e *Engine) projectPushURL(p *project.Project) (string, error) {
+	if e.manifest == nil || p == nil {
+		return "", nil
+	}
+	for _, r := range e.manifest.Remotes {
+		if r.Name == p.RemoteName || (r.Alias != "" && r.Alias == p.RemoteName) {
+			raw := strings.TrimSpace(r.PushURL)
+			if raw == "" {
+				return "", nil
+			}
+			base := raw
+			if !isAbsoluteRemoteURL(raw) {
+				resolved, err := resolveURLAgainstManifest(e.projectManifestBase(p), raw)
+				if err != nil {
+					return "", fmt.Errorf("cannot resolve pushurl %q for project %s: %w", raw, p.Name, err)
+				}
+				base = resolved
+			}
+			base = strings.TrimSuffix(base, "/")
+			if p.Name != "" {
+				base += "/" + strings.TrimSuffix(p.Name, "/")
+			}
+			return base, nil
+		}
+	}
+	return "", nil
+}
+
+// projectReviewURL 返回应写入 remote.<name>.review 的原值（对齐上游
+// GitConfig.Remote.Save：review 不拼接项目名，也不做 URL 规范化）。
+func (e *Engine) projectReviewURL(p *project.Project) string {
+	if e.manifest == nil || p == nil {
+		return ""
+	}
+	for _, r := range e.manifest.Remotes {
+		if r.Name == p.RemoteName || (r.Alias != "" && r.Alias == p.RemoteName) {
+			return strings.TrimSpace(r.Review)
+		}
+	}
+	return ""
 }
 
 // ensureRemoteExists is an alias for setupRemote (unified remote management).
@@ -1799,7 +2159,7 @@ func (e *Engine) pullLFS(ctx context.Context, p *project.Project) error {
 	}
 
 	// 检查仓库是否使LFS
-	output, err := e.runGitInDir(p.Worktree, "lfs", "ls-files")
+	output, err := e.runGitInDir(projectRepoDir(p), "lfs", "ls-files")
 	if err != nil {
 		// 可能不是 LFS 仓库，跳
 		return nil
@@ -1819,7 +2179,7 @@ func (e *Engine) pullLFS(ctx context.Context, p *project.Project) error {
 			if attempt > 0 {
 				e.logger.Info("retrying lfs pull for project %s (attempt %d)", p.Name, attempt)
 			}
-			if _, err := e.runGitInDir(p.Worktree, "lfs", "pull"); err != nil {
+			if _, err := e.runGitInDir(projectRepoDir(p), "lfs", "pull"); err != nil {
 				return fmt.Errorf("LFS pull failed: %w", err)
 			}
 			return nil
@@ -1861,12 +2221,13 @@ func (e *Engine) getProjects() ([]*project.Project, error) {
 	}
 
 	// failed to get project列表 - 修复参数类型
-	projects, err := project.NewManagerFromManifest(e.manifest, e.config).GetProjectsInGroups(e.options.Groups)
+	projects, err := project.NewManagerFromManifest(e.manifest, e.config).GetProjectsInGroups(e.manifestGroups())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get projects: %w", err)
 	}
 
 	e.projects = projects
+	e.applyDefaultRemoteToProjects()
 
 	return e.projects, nil
 }
@@ -1879,7 +2240,7 @@ func (e *Engine) reloadManifestFromCache() error {
 
 	// 解析缓存的manifest数据
 	parser := manifest.NewParser()
-	newManifest, err := parser.ParseFromBytes(e.manifestCache, e.options.Groups)
+	newManifest, err := parser.ParseFromBytes(e.manifestCache, e.manifestGroups())
 	if err != nil {
 		return fmt.Errorf("failed to parse manifest from cache: %w", err)
 	}
@@ -1888,13 +2249,140 @@ func (e *Engine) reloadManifestFromCache() error {
 	e.manifest = newManifest
 
 	// 重新failed to get project列表
-	projects, err := project.NewManagerFromManifest(e.manifest, e.config).GetProjectsInGroups(e.options.Groups)
+	projects, err := project.NewManagerFromManifest(e.manifest, e.config).GetProjectsInGroups(e.manifestGroups())
 	if err != nil {
 		return fmt.Errorf("failed to get projects from cached manifest: %w", err)
 	}
+
+	// smart-sync 重载清单后，仅当命令行显式请求了项目子集时过滤：
+	// 新清单可能包含更多项目，无参数同步应保留全部已审批项目。
+	if len(e.projectSubset) > 0 {
+		filtered := make([]*project.Project, 0, len(projects))
+		for _, p := range projects {
+			if p != nil && e.projectSubset[p.Name] {
+				filtered = append(filtered, p)
+			}
+		}
+		projects = filtered
+	}
 	e.projects = projects
+	e.applyDefaultRemoteToProjects()
 
 	return nil
+}
+
+// manifestGroups 返回解析清单时使用的组过滤：
+// 命令行/调用方显式给出 Groups 时原样使用；为空时回退
+// config.EffectiveGroups()（未配置组时为 "default"，对齐上游默认组语义）。
+func (e *Engine) manifestGroups() []string {
+	// 非 nil（含显式空切片）表示调用方已给出过滤语义：空切片=不过滤。
+	if e.options != nil && e.options.Groups != nil {
+		return e.options.Groups
+	}
+	if e.config != nil {
+		return manifest.SplitGroups(e.config.EffectiveGroups())
+	}
+	return nil
+}
+
+// applySuperprojectRevisionsFromFile 在 --local-only 下复用已有的
+// .repo/superproject-manifest.xml：按 path/name 把其中的 revision 写回
+// project.RevisionID，避免任何网络 fetch。文件不存在时返回 (false, nil)。
+func (e *Engine) applySuperprojectRevisionsFromFile() (bool, error) {
+	repoDir := resolveRepoMetadataDir(e.manifest)
+	manifestPath := filepath.Join(repoDir, "superproject-manifest.xml")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("读取超级项目清单 %s failed: %w", manifestPath, err)
+	}
+
+	var parsed struct {
+		Projects []struct {
+			Name     string `xml:"name,attr"`
+			Path     string `xml:"path,attr"`
+			Revision string `xml:"revision,attr"`
+		} `xml:"project"`
+	}
+	if err := xml.Unmarshal(data, &parsed); err != nil {
+		return false, fmt.Errorf("解析超级项目清单 %s failed: %w", manifestPath, err)
+	}
+
+	byPath := make(map[string]string, len(parsed.Projects))
+	byName := make(map[string]string, len(parsed.Projects))
+	for _, p := range parsed.Projects {
+		revision := strings.TrimSpace(p.Revision)
+		if revision == "" {
+			continue
+		}
+		if p.Path != "" {
+			byPath[p.Path] = revision
+		}
+		if p.Name != "" {
+			byName[p.Name] = revision
+		}
+	}
+
+	for _, p := range e.projects {
+		if p == nil {
+			continue
+		}
+		revision := byPath[p.Path]
+		if revision == "" {
+			revision = byPath[p.Relpath]
+		}
+		if revision == "" {
+			revision = byName[p.Name]
+		}
+		if revision != "" {
+			p.RevisionID = revision
+		}
+	}
+	return true, nil
+}
+
+// applyDefaultRemoteToProjects 对缺少 remote 名的项目应用 --default-remote。
+func (e *Engine) applyDefaultRemoteToProjects() {
+	for _, p := range e.projects {
+		e.applyDefaultRemote(p)
+	}
+}
+
+// applyDefaultRemote 用 --default-remote 兜底缺失的项目 remote 名：
+// 仅在项目未解析出 remote 名时生效，并从清单查询该 remote 的 fetch 基址
+// 补齐 RemoteURL/FetchBase，使 fetch/clone 真正使用该 remote。
+func (e *Engine) applyDefaultRemote(p *project.Project) {
+	if p == nil || e.options == nil {
+		return
+	}
+	name := strings.TrimSpace(e.options.DefaultRemote)
+	if name == "" || p.RemoteName != "" {
+		return
+	}
+	p.RemoteName = name
+	if p.Remote == "" {
+		p.Remote = name
+	}
+	if p.RemoteURL != "" || p.FetchBase != "" || e.manifest == nil {
+		return
+	}
+	base, err := e.manifest.GetRemoteURL(name)
+	if err != nil {
+		return
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return
+	}
+	p.FetchBase = base
+	if isAbsoluteRemoteURL(base) {
+		p.RemoteURL = strings.TrimSuffix(base, "/") + "/" + strings.TrimSuffix(p.Name, "/")
+	} else {
+		// 相对基址留给 resolveRemoteURL 按清单 URL 解析并拼接项目名。
+		p.RemoteURL = base
+	}
 }
 
 // updateProjectsRevisionID 方法
@@ -1977,13 +2465,41 @@ func (e *Engine) Run() error {
 	return e.Sync()
 }
 
-// SetProjects 设置要同步的目列表
+// SetProjects 设置要同步的项目列表。
+// 注意：这里不再记录项目名称集合。smart-sync 从服务器重载清单后，
+// 只有命令行显式传入项目参数时（SetProjectSubset）才保留子集；
+// 无参数同步必须使用重载后的全部已审批项目，避免新增项目被旧名称过滤。
 func (e *Engine) SetProjects(projects []*project.Project) {
 	e.projects = projects
 }
 
+// SetProjectSubset 记录命令行显式请求的项目名称子集。
+// reloadManifestFromCache 在 smart-sync 重载清单后据此过滤，
+// 保证只同步用户请求的项目；未调用时保留重载后的全部项目。
+func (e *Engine) SetProjectSubset(names []string) {
+	if len(names) == 0 {
+		e.projectSubset = nil
+		return
+	}
+	subset := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name != "" {
+			subset[name] = true
+		}
+	}
+	e.projectSubset = subset
+}
+
 // updateSubmodules Updating project的 submodule
 func (e *Engine) updateSubmodules(ctx context.Context, p *project.Project) error {
+	// --local-only 禁止网络操作：submodule update 会访问远端，必须跳过。
+	if e.options.LocalOnly {
+		if e.options.Verbose {
+			e.logger.Debug("--local-only：跳过项目 %s 的 submodule 更新", p.Name)
+		}
+		return nil
+	}
+
 	// 检查是否启用 submodule 功能
 	// 目级 sync-s="true" 也会启用 submodule 更新（对齐上游 repo）
 	if !e.shouldUpdateSubmodules() && !p.SyncS {
@@ -2008,7 +2524,7 @@ func (e *Engine) updateSubmodules(ctx context.Context, p *project.Project) error
 	}
 
 	// 执行 git submodule update --init --recursive
-	args := []string{"-C", p.Worktree, "submodule", "update", "--init", "--recursive"}
+	args := []string{"-C", projectRepoDir(p), "submodule", "update", "--init", "--recursive"}
 
 	// 如果启用了 Quiet 模式，添加 --quiet 参数
 	if e.options.Quiet {

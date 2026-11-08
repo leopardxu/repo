@@ -2,10 +2,10 @@ package repo_sync
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
-	"github.com/leopardxu/repo-go/internal/logger"
 	"github.com/leopardxu/repo-go/internal/project"
 )
 
@@ -23,8 +23,10 @@ type AbandonResult struct {
 // 语义（对齐上游 abandon.py / project.py AbandonBranch）：
 //   - topic != ""：删除每个项目中指定的分支；分支不存在记 NotFound（不计失败），
 //     由上层在"所有项目都没有该分支"时报 "no project has local branch(es)"；
-//   - topic == ""：删除每个项目的所有本地分支，跳过当前分支与 manifest revision 分支
-//     （当前分支不可删除，记为failed）。
+//   - topic == ""：删除每个项目的全部本地分支，对齐上游 GetBranches() +
+//     AbandonBranch()：当前分支先 detach 到 manifest revision 再删除，manifest
+//     revision 分支本身也删除（不再跳过 "受保护" 分支，因此仅剩当前/manifest
+//     分支时仍会正常处理并成功）。
 //
 // 当 e.options.DryRun 为 true 时，只打印将要删除的分支，不实际删除。
 func (e *Engine) AbandonTopics(projects []*project.Project, topic string) []AbandonResult {
@@ -58,37 +60,45 @@ func (e *Engine) AbandonTopics(projects []*project.Project, topic string) []Aban
 				}
 				branches = []string{topic}
 			} else {
-				// --all：枚举所有本地分支，跳过当前分支与 manifest revision 分支
-				currentBranch, _ := proj.GetCurrentBranch()
-				manifestRev := proj.Revision
-				manifestRev = strings.TrimPrefix(manifestRev, "refs/heads/")
+				// --all：对齐上游 abandon.py 的 GetBranches()/AbandonBranch()：
+				//   - 删除每个项目的全部本地分支（包括 manifest revision 分支）；
+				//   - 当前分支由 project.DeleteBranch 先 detach 到 manifest revision
+				//     再删除，因此当前分支必须排在最前：manifest 分支可能在其后
+				//     被删除，若先删 manifest 分支，后续 detach 目标就不存在了。
+				// 当前分支检测使用 project.GetCurrentBranch（Repository.CurrentBranch
+				// 基于完整 symbolic-ref HEAD 并剥离 refs/heads/，不再使用存在同名
+				// tag 歧义的 --short）。
 				all, err := proj.ListLocalBranches()
 				if err != nil {
 					resultsChan <- AbandonResult{Project: proj, Branch: "", Success: false, Error: fmt.Errorf("列出分支failed: %w", err)}
 					return
 				}
+				// 项目没有任何本地分支时不产生结果，由上层报
+				// "no project has local branch(es)"（对齐上游 success 为空）。
+				if len(all) == 0 {
+					return
+				}
+				currentBranch, cerr := proj.GetCurrentBranch()
+				if cerr != nil {
+					resultsChan <- AbandonResult{Project: proj, Success: false, Error: fmt.Errorf("获取当前分支failed: %w", cerr)}
+					return
+				}
+				currentBranch = abandonLocalBranchName(currentBranch)
+				branches = make([]string, 0, len(all))
 				for _, b := range all {
 					if b == currentBranch {
-						continue // 当前分支不可删除
+						branches = append(branches, b)
 					}
-					if b == manifestRev {
-						continue // manifest revision 分支不可删除（保护同步基准）
+				}
+				for _, b := range all {
+					if b == currentBranch {
+						continue
 					}
 					branches = append(branches, b)
-				}
-				if len(branches) == 0 {
-					resultsChan <- AbandonResult{Project: proj, Branch: "", Success: true, Error: nil}
-					return
 				}
 			}
 
 			for _, branch := range branches {
-				// 分离HEAD状态：无需删除
-				if strings.HasPrefix(branch, "HEAD detached at ") {
-					resultsChan <- AbandonResult{Project: proj, Branch: branch, Success: true, Error: nil}
-					continue
-				}
-
 				// dry-run：只打印，不删除
 				if e.options.DryRun {
 					if !e.options.Quiet && e.logger != nil {
@@ -132,9 +142,18 @@ func (e *Engine) AbandonTopics(projects []*project.Project, topic string) []Aban
 	return results
 }
 
-// PrintAbandonSummary 输出放弃分支的汇总信息。
+// abandonLocalBranchName 把 GetCurrentBranch 的结果归一为本地分支短名：
+// 完整 refs/heads/X 去掉前缀；detached sentinel、SHA、tag 原样返回。
+// 这样无论 Repository.CurrentBranch 返回完整 ref 还是短名，都能与
+// ListLocalBranches 的短名列表正确比较。
+func abandonLocalBranchName(name string) string {
+	return strings.TrimPrefix(strings.TrimSpace(name), "refs/heads/")
+}
+
+// PrintAbandonSummary 把放弃分支的汇总信息写到 w（结果 payload，调用方传 os.Stdout）。
 // dryRun 为 true 时输出"将删除"而非"成功删除"；NotFound 结果不计入成功/失败。
-func PrintAbandonSummary(results []AbandonResult, dryRun bool, log logger.Logger) {
+// 即使 -q 也不得吞掉该输出（只有诊断日志受 -q 影响）。
+func PrintAbandonSummary(w io.Writer, results []AbandonResult, dryRun bool) {
 	total := 0
 	success := 0
 	failed := 0
@@ -144,7 +163,6 @@ func PrintAbandonSummary(results []AbandonResult, dryRun bool, log logger.Logger
 		action = "将删除分支"
 	}
 
-	// 按项目名称排序输出结果
 	for _, r := range results {
 		switch {
 		case r.NotFound:
@@ -153,26 +171,13 @@ func PrintAbandonSummary(results []AbandonResult, dryRun bool, log logger.Logger
 		case r.Success:
 			total++
 			success++
-			if log != nil {
-				log.Info("[OK]    %s: %s %s", r.Project.Name, action, r.Branch)
-			} else {
-				fmt.Printf("[OK]    %s: %s %s\n", r.Project.Name, action, r.Branch)
-			}
+			fmt.Fprintf(w, "[OK]    %s: %s %s\n", r.Project.Name, action, r.Branch)
 		default:
 			total++
 			failed++
-			if log != nil {
-				log.Error("[FAIL]  %s: 删除分支 %s failed (%v)", r.Project.Name, r.Branch, r.Error)
-			} else {
-				fmt.Printf("[FAIL]  %s: %s (%v)\n", r.Project.Name, r.Branch, r.Error)
-			}
+			fmt.Fprintf(w, "[FAIL]  %s: 删除分支 %s failed (%v)\n", r.Project.Name, r.Branch, r.Error)
 		}
 	}
 
-	// 输出汇总信息
-	if log != nil {
-		log.Info("\n共处理项 %d, 成功: %d, failed: %d, 未找到分支: %d", total, success, failed, notFound)
-	} else {
-		fmt.Printf("\n共处理项 %d, 成功: %d, failed: %d, 未找到分支: %d\n", total, success, failed, notFound)
-	}
+	fmt.Fprintf(w, "\n共处理项 %d, 成功: %d, failed: %d, 未找到分支: %d\n", total, success, failed, notFound)
 }

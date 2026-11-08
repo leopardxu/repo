@@ -2,7 +2,6 @@ package commands
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -118,10 +117,10 @@ func runList(opts *ListOptions, args []string) error {
 	}
 	opts.Config = cfg
 
-	// 加载清单
+	// 加载清单（显式 --groups 优先，否则 cfg.Groups；只解析一次）
 	log.Debug("正在解析清单文件...")
 	parser := manifest.NewParser()
-	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, manifest.SplitGroups(cfg.Groups))
+	manifestObj, err := parser.ParseFromFile(cfg.ManifestName, readCmdEffectiveGroups(opts.Groups, cfg))
 	if err != nil {
 		log.Error("failed to parse manifest file: %v", err)
 		return fmt.Errorf("failed to parse manifest: %w", err)
@@ -134,17 +133,12 @@ func runList(opts *ListOptions, args []string) error {
 	// 获取要处理的项目
 	log.Debug("正在failed to get project列表...")
 	var projects []*project.Project
-	var groupsArg []string
-	if opts.Groups != "" {
-		groupsArg = manifest.SplitGroups(opts.Groups)
-		log.Debug("按组过滤项目: %v", groupsArg)
-	}
 
 	if opts.Regex != "" {
 		// -r：对全部项目按模式过滤（flag 值 + 全部位置参数均为模式，对齐上游
 		// list.py "repo list -r str1 [str2...]" 与 command.py FindProjects：
 		// 忽略大小写，匹配项目名或相对路径，任一模式命中即保留）
-		all, aerr := manager.GetProjectsInGroups(groupsArg)
+		all, aerr := manager.GetProjectsInGroups(nil)
 		if aerr != nil {
 			log.Error("failed to get projectfailed: %v", aerr)
 			return fmt.Errorf("failed to get projects: %w", aerr)
@@ -171,7 +165,7 @@ func runList(opts *ListOptions, args []string) error {
 		log.Debug("模式过滤后剩余 %d 个项目", len(projects))
 	} else if len(args) == 0 {
 		log.Debug("获取所有项目")
-		projects, err = manager.GetProjectsInGroups(groupsArg)
+		projects, err = manager.GetProjectsInGroups(nil)
 		if err != nil {
 			log.Error("failed to get projectfailed: %v", err)
 			return fmt.Errorf("failed to get projects: %w", err)
@@ -196,14 +190,12 @@ func runList(opts *ListOptions, args []string) error {
 
 	log.Debug("找到 %d 个项目", len(projects))
 
-	// --all：默认仅列出已 checkout（工作树存在）的项目；--all 列出全部（对齐上游 repo list）
+	// --all：默认仅列出已初始化仓库的项目（普通项目工作树 / 镜像裸库）；
+	// --all 列出全部（对齐上游 repo list）
 	if !opts.AllProjects {
 		filtered := make([]*project.Project, 0, len(projects))
 		for _, p := range projects {
-			if p.Worktree == "" {
-				continue
-			}
-			if _, statErr := os.Stat(p.Worktree); statErr == nil {
+			if readCmdProjectExists(p) {
 				filtered = append(filtered, p)
 			}
 		}
@@ -212,52 +204,90 @@ func runList(opts *ListOptions, args []string) error {
 
 	stats := &listStats{}
 
-	// 上游 repo list 对输出行排序后打印：按 path（默认输出首列）排序保证确定性
-	sort.Slice(projects, func(i, j int) bool { return projects[i].Path < projects[j].Path })
-
-	// 不并发以避免输出乱序
+	// 上游 repo list 先收集输出行，再整体排序后打印，保证确定性
+	lines := make([]string, 0, len(projects))
 	for _, p := range projects {
-		var output string
-		path := p.Path
-		if opts.RelativeTo != "" {
-			relPath, err := filepath.Rel(opts.RelativeTo, p.Path)
-			if err == nil {
-				path = relPath
+		// 展示一律使用 Relpath：镜像项目的 Path 可能是绝对裸库路径，
+		// 不得把 .git 目录暴露给用户（Path 已改为 relpath 后保持一致）。
+		relPath := readCmdProjectRelpath(p)
+		displayPath := relPath
+		if opts.RelativeTo != "" && !opts.FullPath {
+			// 项目绝对路径 = TopDir + 清单 Path，再与 relative-to 求相对路径。
+			relTo, rerr := listRelativePath(manager.TopDir, opts.RelativeTo, relPath)
+			if rerr == nil {
+				displayPath = relTo
 			} else {
-				log.Debug("failed to compute relative path: %v", err)
+				log.Debug("failed to compute relative path: %v", rerr)
 			}
 		}
-
-		switch {
-		case opts.Path:
-			output = path
-		case opts.URL:
-			// --url 输出解析后的远程仓库 URL：相对 fetch 路径基于 manifest 服务器解析
-			// （上游 GetRemoteUrl），为空时回退 remote 名称
-			output = manager.ResolveRemoteURL(p.RemoteURL)
-			if output == "" {
-				output = p.RemoteName
-			}
-		case opts.FullName:
-			output = fmt.Sprintf("%s : %s", p.Name, path)
-		case opts.FullPath:
-			absPath, err := filepath.Abs(p.Path)
-			if err == nil {
-				output = absPath
-			} else {
-				log.Debug("计算绝对路径failed: %v", err)
-				output = p.Path
-			}
-		default:
-			// 默认输出项目目录与名称，与原生git-repo保持一致
-			output = fmt.Sprintf("%s : %s", path, p.Name)
+		if opts.FullPath {
+			displayPath = listProjectAbsPath(manager.TopDir, relPath)
 		}
 
-		fmt.Println(output)
-		stats.success++
+		// --url 输出解析后的远程仓库 URL：基址（相对 fetch 基于 manifest
+		// 服务器解析）无条件拼接项目名，项目名不重复拼接。
+		remoteURL := manager.ResolveProjectURL(p)
+		if remoteURL == "" {
+			remoteURL = p.RemoteName
+		}
+
+		lines = append(lines, listProjectOutput(p, displayPath, remoteURL, opts))
 	}
+
+	sort.Strings(lines)
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	stats.success = len(lines)
 
 	log.Debug("列出完成，共处理 %d 个项目", stats.success)
 
 	return nil
+}
+
+// listProjectOutput 按上游 list.py Execute 的优先级生成一行输出：
+//   - -n 仅名称（与 -p 同用时仍输出 "path : name"）；
+//   - -p 仅路径（与 -f/--relative-to 组合时使用对应展示路径）；
+//   - 默认及 -p/-n 同用时输出 "path : name"。
+func listProjectOutput(p *project.Project, displayPath, remoteURL string, opts *ListOptions) string {
+	switch {
+	case opts.Name && opts.Path:
+		return fmt.Sprintf("%s : %s", displayPath, p.Name)
+	case opts.Name:
+		return p.Name
+	case opts.Path:
+		return displayPath
+	case opts.URL:
+		return remoteURL
+	case opts.FullName:
+		return fmt.Sprintf("%s : %s", p.Name, displayPath)
+	default:
+		// 默认输出项目目录与名称，与原生 git-repo 保持一致
+		return fmt.Sprintf("%s : %s", displayPath, p.Name)
+	}
+}
+
+// listProjectAbsPath 返回项目绝对路径：清单中的 Path 为相对路径时，以 repo 顶层
+// 目录（TopDir）为基准拼接（对齐上游 worktree = topdir + relpath）。
+func listProjectAbsPath(topDir, projectPath string) string {
+	p := projectPath
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(topDir, p)
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return filepath.Clean(p)
+}
+
+// listRelativePath 计算 --relative-to 的展示路径。relativeTo 允许相对或绝对路径，
+// 统一切成绝对路径后与项目绝对路径求 Rel。
+func listRelativePath(topDir, relativeTo, projectPath string) (string, error) {
+	base := relativeTo
+	if !filepath.IsAbs(base) {
+		if abs, err := filepath.Abs(base); err == nil {
+			base = abs
+		}
+	}
+	return filepath.Rel(base, listProjectAbsPath(topDir, projectPath))
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,9 +20,11 @@ import (
 var log logger.Logger = logger.NewDefaultLogger()
 var logMu sync.RWMutex
 
-// 配置缓存
+// 配置缓存。缓存 key 由配置文件路径（已包含 RepoRoot）与 mtime 组成，
+// 避免在不同 repo 根目录之间错误复用配置。
 var (
 	configCache       *Config
+	configCachePath   string
 	configMutex       sync.RWMutex
 	configLastModTime time.Time
 )
@@ -128,10 +131,17 @@ func Load() (*Config, error) {
 		return nil, &ConfigError{Op: "load", Path: configPath, Err: fmt.Errorf("failed to access config file: %w", err)}
 	}
 
-	// 检查缓存是否有效
+	// 缓存有效性：路径（含 RepoRoot）与 mtime 都必须一致。mtime 用 != 语义
+	// 判定失效（仅相等才命中），避免旧实现 !After 把时间回退误判为有效。
+	cacheValid := func() bool {
+		return configCache != nil &&
+			configCachePath == configPath &&
+			fileInfo.ModTime().Equal(configLastModTime)
+	}
+
+	// 检查缓存是否有效（命中路径也返回副本，避免调用方修改缓存）
 	configMutex.RLock()
-	if configCache != nil && !fileInfo.ModTime().After(configLastModTime) {
-		// 确保返回的缓存配置包含正确的 RepoRoot
+	if cacheValid() {
 		cached := *configCache
 		cached.RepoRoot = repoRoot
 		configMutex.RUnlock()
@@ -145,7 +155,7 @@ func Load() (*Config, error) {
 	defer configMutex.Unlock()
 
 	// 再次检查，避免在获取写锁期间其他goroutine已经更新了缓存
-	if configCache != nil && !fileInfo.ModTime().After(configLastModTime) {
+	if cacheValid() {
 		cached := *configCache
 		cached.RepoRoot = repoRoot
 		return &cached, nil
@@ -189,12 +199,14 @@ func Load() (*Config, error) {
 	// 写入正确的 RepoRoot，供上层使用
 	config.RepoRoot = repoRoot
 
-	// 更新缓存
+	// 更新缓存（miss 路径也返回副本，调用方修改不会污染包级缓存）
 	configCache = &config
+	configCachePath = configPath
 	configLastModTime = fileInfo.ModTime()
 
 	log.Debug("成功加载配置")
-	return configCache, nil
+	result := config
+	return &result, nil
 }
 
 // Save 保存配置
@@ -238,12 +250,19 @@ func (c *Config) Save() error {
 		return &ConfigError{Op: "write", Path: configPath, Err: err}
 	}
 
-	// 更新缓存
+	// 更新缓存：写入副本，避免包级缓存与调用方持有的 *Config 别名共享
 	configMutex.Lock()
-	configCache = c
-	fileInfo, _ := os.Stat(configPath)
-	if fileInfo != nil {
+	fileInfo, statErr := os.Stat(configPath)
+	if statErr == nil {
+		cached := *c
+		configCache = &cached
+		configCachePath = configPath
 		configLastModTime = fileInfo.ModTime()
+	} else {
+		// 无法确认 mtime 时让缓存失效，下次 Load 重新读取
+		configCache = nil
+		configCachePath = ""
+		configLastModTime = time.Time{}
 	}
 	configMutex.Unlock()
 
@@ -347,8 +366,9 @@ func (c *Config) GetRemoteURL() string {
 		}
 	}
 
-	// 如果无法从manifest.xml获取，尝试从.repo/config.json读取
-	configPath := filepath.Join(".repo", "config.json")
+	// 如果无法从manifest.xml获取，尝试从已发现的 repoRoot 下读取 config.json
+	// （不能依赖当前工作目录，命令可能从任意子目录执行）
+	configPath := filepath.Join(repoRoot, ".repo", "config.json")
 	if _, err := os.Stat(configPath); err == nil {
 		// 读取config.json文件
 		data, err := os.ReadFile(configPath)
@@ -374,35 +394,31 @@ func (c *Config) GetRemoteURL() string {
 	return c.ExtractBaseURLFromManifestURL(c.ManifestURL)
 }
 
-// ExtractBaseURLFromManifestURL 从清单URL中提取基础URL
+// ExtractBaseURLFromManifestURL 从清单URL中提取基础URL。
+// 带 scheme 的 URL 统一用 net/url 解析，保留 scheme 与 host（含 userinfo/端口）；
+// 必须先判断 http(s)，否则 "https://user@host/..." 会被误判为 scp 风式。
 func (c *Config) ExtractBaseURLFromManifestURL(manifestURL string) string {
-	// 处理SSH URL格式: ssh://git@example.com/path/to/repo
-	if strings.HasPrefix(manifestURL, "ssh://") {
-		// 查找第三个斜杠的位置（ssh://后的第一个斜杠）
-		parts := strings.SplitN(manifestURL, "/", 4)
-		if len(parts) >= 3 {
-			// 返回 ssh://hostname 部分
-			return strings.Join(parts[:3], "/")
+	lower := strings.ToLower(manifestURL)
+	if strings.HasPrefix(lower, "http://") ||
+		strings.HasPrefix(lower, "https://") ||
+		strings.HasPrefix(lower, "ssh://") {
+		if u, err := url.Parse(manifestURL); err == nil && u.Host != "" {
+			host := u.Host
+			if u.User != nil {
+				host = u.User.String() + "@" + host
+			}
+			return u.Scheme + "://" + host
 		}
 	}
 
 	// 处理SCP格式: git@example.com:path/to/repo
-	if strings.Contains(manifestURL, "@") && strings.Contains(manifestURL, ":") {
+	if strings.Contains(manifestURL, "@") && strings.Contains(manifestURL, ":") &&
+		!strings.Contains(manifestURL, "://") {
 		// 查找冒号的位置
 		parts := strings.SplitN(manifestURL, ":", 2)
 		if len(parts) == 2 {
 			// 返回 user@hostname 部分
 			return parts[0]
-		}
-	}
-
-	// 处理HTTP/HTTPS URL
-	if strings.HasPrefix(manifestURL, "http://") || strings.HasPrefix(manifestURL, "https://") {
-		// 查找第三个斜杠后的部分
-		parts := strings.SplitN(manifestURL, "/", 4)
-		if len(parts) >= 3 {
-			// 返回 protocol://hostname 部分
-			return strings.Join(parts[:3], "/")
 		}
 	}
 
@@ -440,39 +456,90 @@ func (c *Config) GetProjectRemoteURL(projectName string) string {
 	return ""
 }
 
-// ResolveRelativeURL 将相对URL解析为完整URL
+// isScpLikeURL 判断是否为 git 的 scp 风式地址（[user@]host:path，无 scheme）。
+// 判定规则与 git 一致：冒号必须出现在第一个路径分隔符之前（且 host 非空），
+// 因此 "git@host:path" 与 "host:path" 都算 scp 风式，而 "dir/file:tag"、
+// "https://user@host/..." 不算。userinfo 可省略，不能强制要求 "@"。
+func isScpLikeURL(raw string) bool {
+	if raw == "" || strings.Contains(raw, "://") {
+		return false
+	}
+	colon := strings.Index(raw, ":")
+	if colon <= 0 {
+		return false
+	}
+	host := raw[:colon]
+	// host 段不得包含路径分隔符或空白；带 userinfo 时形如 user@host。
+	if strings.ContainsAny(host, `/\`) || strings.ContainsAny(host, " \t") {
+		return false
+	}
+	return true
+}
+
+// normalizeScpURL 把 scp 风式地址规范化为 ssh:// URL，便于统一走 urljoin。
+func normalizeScpURL(raw string) string {
+	return "ssh://" + strings.Replace(raw, ":", "/", 1)
+}
+
+// ResolveRelativeURL 将 fetch 地址解析为完整 URL（urljoin 语义）：
+//   - 带 scheme、scp 风式（[user@]host:path）与绝对文件路径已是完整地址，
+//     原样返回（幂等），本地路径分支不得把它 filepath.Join 到 base 目录；
+//   - 其余地址（含 "."、".."、"./"、"../" 以及不带点号的相对 fetch，
+//     如 "platform"）一律按 urljoin 解析：带 scheme 或 scp 风式的 base
+//     走 net/url，无 scheme 的绝对文件路径按 path/filepath 语义解析。
+//
+// 没有可用的 base URL 或无法解析时返回空串，绝不放回原样相对值，
+// 避免调用方把相对路径误当成完整地址。
 func (c *Config) ResolveRelativeURL(relativeURL string) string {
 	log.Debug("解析相对URL: %s", relativeURL)
 
-	// 如果不是相对路径，直接返回
-	if !strings.HasPrefix(relativeURL, "../") {
+	if c == nil || relativeURL == "" {
+		return ""
+	}
+
+	// 已完整的地址不需要（也不应）再解析。
+	if strings.Contains(relativeURL, "://") || isScpLikeURL(relativeURL) || filepath.IsAbs(relativeURL) {
 		return relativeURL
 	}
 
-	// 如果是相对路径，尝试将其转换为完整URL
-	if !strings.Contains(relativeURL, "://") {
-		// 从配置中获取基础URL
-		// 从配置中获取基础URL
-		var baseURL string
-		if c.DefaultRemoteURL != "" {
-			baseURL = c.DefaultRemoteURL
-		} else if c.ManifestURL != "" {
-			baseURL = c.ExtractBaseURLFromManifestURL(c.ManifestURL)
-		}
-
-		// 确保baseURL结尾
-		if !strings.HasSuffix(baseURL, "/") {
-			baseURL += "/"
-		}
-
-		// 移除相对路径前缀
-		relPath := strings.TrimPrefix(relativeURL, "../")
-		resolvedURL := baseURL + relPath
-		log.Debug("解析结果: %s", resolvedURL)
-		return resolvedURL
+	base := c.DefaultRemoteURL
+	if base == "" {
+		base = c.ManifestURL
+	}
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		return ""
 	}
 
-	return relativeURL
+	// scp 风式先规范化为 ssh://，使 urljoin 能正确处理 host 与路径分隔。
+	if isScpLikeURL(base) {
+		base = normalizeScpURL(base)
+	}
+
+	// 无 scheme 的绝对文件路径：使用 path/filepath 语义（url.Parse 会得到空 scheme）。
+	if !strings.Contains(base, "://") {
+		if !filepath.IsAbs(base) {
+			return ""
+		}
+		resolved := filepath.Join(filepath.Dir(base), filepath.FromSlash(relativeURL))
+		log.Debug("解析结果: %s", resolved)
+		return resolved
+	}
+
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme == "" {
+		return ""
+	}
+	ref, err := url.Parse(relativeURL)
+	if err != nil {
+		return ""
+	}
+	resolved := u.ResolveReference(ref)
+	if resolved.Scheme == "" {
+		return ""
+	}
+	log.Debug("解析结果: %s", resolved.String())
+	return resolved.String()
 }
 
 // Validate 验证配置的完整性和正确性
@@ -547,16 +614,43 @@ func (c *Config) GetJobs() int {
 	return runtime.NumCPU()
 }
 
-// IsColorEnabled 检查是否启用颜色输出
+// IsColorEnabled 检查是否启用颜色输出。
+// auto（及空值）仅在 stdout 是终端时启用；重定向到文件/管道或 CI 环境无色。
 func (c *Config) IsColorEnabled() bool {
-	if c.Color == "never" {
+	switch c.Color {
+	case "never":
+		return false
+	case "always":
+		return true
+	default: // auto 或其他值
+		return isTerminalFile(os.Stdout)
+	}
+}
+
+// isTerminalFile 判断文件是否为字符设备（TTY）。测试可重定向 os.Stdout
+// 到普通文件，此时返回 false。
+func isTerminalFile(f *os.File) bool {
+	if f == nil {
 		return false
 	}
-	if c.Color == "always" {
-		return true
+	fi, err := f.Stat()
+	if err != nil {
+		return false
 	}
-	// auto 或其他值，默认启用颜色（如果终端支持）
-	return true
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// EffectiveGroups 返回解析项目清单时使用的组过滤值：
+// 显式配置非空时返回原值，未配置（空）时回退 "default"，
+// 使各命令在未显式指定 -g 时与上游 repo 的默认组语义一致。
+func (c *Config) EffectiveGroups() string {
+	if c == nil {
+		return "default"
+	}
+	if strings.TrimSpace(c.Groups) != "" {
+		return c.Groups
+	}
+	return "default"
 }
 
 // GetDefaultGroups 获取默认项目组

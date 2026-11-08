@@ -3,7 +3,6 @@ package project
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,42 +51,67 @@ func NewManagerFromManifest(m *manifest.Manifest, cfg *config.Config) *Manager {
 		RepoDir:      m.RepoDir,
 		GitRunner:    git.NewRunner(),
 	}
-	// 解析 repo 根目录：调用方（各命令）已 chdir 至根目录，GetRepoRoot 可直接命中；
-	// 失败时回退为 RepoDir 的父目录（RepoDir 通常为 ".repo"）
-	if topDir, terr := config.GetRepoRoot(); terr == nil && topDir != "" {
+	// 解析 repo 根目录：RepoDir 为绝对路径时其父目录就是工作区根（最可靠，
+	// 不受 CWD 影响）；否则调用方通常已 chdir 至根目录，GetRepoRoot 可命中；
+	// 最后回退为 RepoDir 的父目录（RepoDir 通常为 ".repo"）。
+	if m.Topdir != "" {
+		manager.TopDir = m.Topdir
+	} else if m.RepoDir != "" && filepath.IsAbs(m.RepoDir) {
+		manager.TopDir = filepath.Dir(m.RepoDir)
+	} else if topDir, terr := config.GetRepoRoot(); terr == nil && topDir != "" {
 		manager.TopDir = topDir
 	} else if d := filepath.Dir(m.RepoDir); d != "" && d != "." {
 		manager.TopDir = d
 	} else {
 		manager.TopDir = "."
 	}
-	// 清单服务器 URL（manifest-server 标签）优先；无标签时回退清单仓库 URL
-	// （config.json 的 manifest_url），相对 fetch 路径（如 ".."）需要基于它解析
-	if m.ManifestServer != nil && m.ManifestServer.URL != "" {
-		manager.ManifestURL = m.ManifestServer.URL
-	} else if cfg != nil {
+	// 相对 fetch 路径（如 ".."）只能基于清单仓库 URL（config.json 的
+	// manifest_url）解析。manifest-server 是清单服务器地址，不是仓库
+	// urljoin 基准，绝不能参与相对 fetch 解析（对齐上游 GetManifestProject 语义）。
+	if cfg != nil {
 		manager.ManifestURL = cfg.ManifestURL
 	}
 
 	// 从清单中加载项目
-	// 在镜像模式下，需要去重
+	// 镜像模式下以生成的镜像路径（<topdir>/<name>.git）为唯一键去重；
+	// 普通模式不合并，不同工作树路径即使同名也各自保留。
 	isMirror := cfg != nil && cfg.Mirror
-	seenPaths := make(map[string]bool) // 用于跟踪已处理的路径，避免重复
+	seenProjects := make(map[string]string, len(m.Projects))
 
 	for _, p := range m.Projects {
-		// 获取远程信息
-		var remoteName, remoteFetch string
+		// 获取远程信息（remote name 可能是 alias，匹配时一并考虑）
+		var remoteName, remoteFetch, remotePushURL, remoteReview string
 		if p.Remote != "" {
 			remoteName = p.Remote
 		} else if m.Default.Remote != "" {
 			remoteName = m.Default.Remote
 		}
 
-		// 查找远程配置（这里保存的是 remote 的 fetch 基地址，不含项目名）
+		// 查找远程配置（这里保存的是 remote 的 fetch 基地址，不含项目名）。
+		// 先按 name 精确匹配，未命中再按 alias 匹配。
+		// 对齐上游 ToRemoteSpec：remote 声明了 alias 时，RemoteName 使用 alias，
+		// 而 fetch/pushurl 始终取自该 remote。
+		foundRemote := false
 		for _, r := range m.Remotes {
 			if r.Name == remoteName {
 				remoteFetch = r.Fetch
+				remotePushURL = r.PushURL
+				remoteReview = r.Review
+				if r.Alias != "" {
+					remoteName = r.Alias
+				}
+				foundRemote = true
 				break
+			}
+		}
+		if !foundRemote {
+			for _, r := range m.Remotes {
+				if r.Alias != "" && r.Alias == remoteName {
+					remoteFetch = r.Fetch
+					remotePushURL = r.PushURL
+					remoteReview = r.Review
+					break
+				}
 			}
 		}
 
@@ -97,44 +121,66 @@ func NewManagerFromManifest(m *manifest.Manifest, cfg *config.Config) *Manager {
 			revision = m.Default.Revision
 		}
 
-		// 创建项目路径
-		var projectPath string
-		if isMirror {
-			// 在镜像模式下，根据远程URL的路径结构确定项目路径
-			// 注意：这里传入的是 fetch 基地址，保持原有镜像布局不变
-			projectPath = manager.getMirrorProjectPath(p.Path, remoteFetch, p.Name)
-		} else {
-			// 普通模式下，使用清单中的路径
-			projectPath = filepath.Join(m.RepoDir, p.Path)
+		// 清单路径为空时退回项目名；去掉尾部斜杠（对齐上游 GetProjectPaths
+		// 的 rstrip("/")），保证工作区相对路径与镜像 name 无歧义。
+		relPath := strings.TrimRight(strings.TrimSpace(p.Path), "/")
+		if relPath == "" {
+			relPath = strings.TrimRight(strings.TrimSpace(p.Name), "/")
 		}
 
-		// 在镜像模式下进行去重检查
+		// 创建项目路径。镜像模式对齐上游 GetProjectPaths：
+		// worktree=None，gitdir=objdir=<topdir>/<name>.git（name 含嵌套前缀）。
+		// 去重键使用生成的镜像路径：同名项目映射到同一目录，必须显式报告
+		// 碰撞，不能静默丢弃。普通模式 Path 是工作区相对路径，不能拼接 .repo。
+		projectPath := relPath
 		if isMirror {
-			if seenPaths[projectPath] {
-				// 路径已存在，跳过这个项目
-				logger.Debug("镜像模式下去重，跳过项目: %s (路径: %s)", p.Name, projectPath)
+			projectPath = manager.getMirrorProjectPath(relPath, p.Name)
+			if prev, exists := seenProjects[projectPath]; exists {
+				logger.Error("镜像路径冲突：项目 %s 与 %s 均映射到 %s，跳过后者", prev, p.Name, projectPath)
 				continue
 			}
-			// 标记路径已处理
-			seenPaths[projectPath] = true
+			seenProjects[projectPath] = p.Name
 		}
 
 		// 创建项目对象
 		// 对齐上游 repo（manifest_xml.py 的 ToRemoteSpec）：
-		// 项目 URL = remote fetch 去掉尾部 '/' 后拼接项目名（name，非 path）。
-		// 若不拼接，形如 ssh://host:29418 的无路径 fetch 会导致
-		// `git clone` 报 "未指定路径" 错误。
-		// 相对 fetch（..、../、./）保持原样，由同步引擎基于 manifest
-		// 服务器 URL 解析相对路径时再拼接项目名，避免此处二次拼接。
+		// 原始 fetch 基址保存在 FetchBase，完整项目 URL = 基址 urljoin 后
+		// 无条件拼接 "/"+项目名（name，非 path）。若不拼接，形如
+		// ssh://host:29418 的无路径 fetch 会导致 `git clone` 报 "未指定路径"。
 		project := NewProject(
 			p.Name,
 			projectPath,
 			remoteName,
-			projectURLFromFetch(remoteFetch, p.Name),
+			"",
 			revision,
 			p.EffectiveGroups(),
-			git.NewRunner(),
+			manager.GitRunner,
 		)
+		// 工作树与仓库目录（对齐上游 GetProjectPaths）：
+		//   - 镜像：worktree=None，gitdir=objdir=<topdir>/<name>.git；
+		//   - 普通：worktree=<topdir>/<relpath>，gitdir=<worktree>/.git。
+		project.ManifestURL = manager.ManifestURL
+		project.Relpath = relPath
+		project.FetchBase = remoteFetch
+		project.RemoteURL = manager.ResolveProjectURL(project)
+		project.PushURL = manager.resolveProjectPushURL(remotePushURL, remoteFetch, p.Name)
+		project.ReviewURL = ResolveReviewURL(remoteReview, p.Name)
+		if isMirror {
+			// 镜像的 Path 仍是清单相对路径；仓库目录只走 Gitdir/Objdir，
+			// 调用方不能再用 Path 定位镜像仓库。
+			project.Path = relPath
+			project.Mirror = true
+			project.Worktree = ""
+			project.Gitdir = projectPath
+			project.Objdir = projectPath
+			project.GitRepo = git.NewRepository(projectPath, manager.GitRunner)
+		} else {
+			project.Worktree = filepath.Join(manager.TopDir, relPath)
+			project.Gitdir = filepath.Join(project.Worktree, ".git")
+			// GitRepo 必须指向工作树（非镜像项目 Path 是 workspace 相对路径，
+			// 而工作树已基于 TopDir 展开；两者不一致时以 Worktree 为准）。
+			project.GitRepo = git.NewRepository(project.Worktree, manager.GitRunner)
+		}
 
 		// 转换并赋值 Linkfiles 字段
 		if len(p.Linkfiles) > 0 {
@@ -159,8 +205,8 @@ func NewManagerFromManifest(m *manifest.Manifest, cfg *config.Config) *Manager {
 		}
 
 		// 映射项目级属性（对齐上游 repo manifest project 属性）
-		project.SyncS = p.SyncS
-		project.SyncC = p.SyncC
+		project.SyncS = p.SyncS.Get(false)
+		project.SyncC = p.SyncC.Get(false)
 		// SyncTags 取最终值：项目显式声明优先，缺省继承 default（上游默认 true）
 		project.SyncTags = p.SyncTags.Get(true)
 		project.CloneDepth = p.CloneDepth
@@ -175,23 +221,19 @@ func NewManagerFromManifest(m *manifest.Manifest, cfg *config.Config) *Manager {
 	return manager
 }
 
-// projectURLFromFetch 对齐上游 repo（manifest_xml.py 的 ToRemoteSpec）：
-// 项目 URL = resolvedFetchUrl.rstrip('/') + '/' + name。
-// 空 fetch 或相对 fetch（..、../、./）原样返回：前者由同步引擎按 manifest URL
-// 回退处理，后者由引擎解析相对路径时拼接项目名，此处不能提前拼接。
-func projectURLFromFetch(fetch, projectName string) string {
-	if fetch == "" || isRelativeFetchURL(fetch) {
-		return fetch
-	}
-	return strings.TrimSuffix(fetch, "/") + "/" + projectName
+// resolveProjectPushURL 计算项目的完整推送地址（薄包装）：urljoin 基准取
+// 清单仓库 URL，实际拼接由 project.ResolvePushURL 统一完成。
+func (m *Manager) resolveProjectPushURL(pushURL, fetchURL, projectName string) string {
+	return ResolvePushURL(&config.Config{ManifestURL: m.ManifestURL}, pushURL, fetchURL, projectName)
 }
 
-// isRelativeFetchURL 判断 remote fetch 是否为相对路径（..、../、./ 前缀），
-// 这类 fetch 需要基于 manifest 服务器 URL 解析（对齐上游 urljoin 语义）。
+// isRelativeFetchURL 判断 remote fetch 是否为相对路径（"."、".."、"../"、"./"）。
+// 这类 fetch 需要基于 manifest 仓库 URL 解析（对齐上游 urljoin 语义）。
 func isRelativeFetchURL(fetch string) bool {
-	return fetch == ".." ||
-		strings.HasPrefix(fetch, "../") ||
-		strings.HasPrefix(fetch, "./")
+	if fetch == "." || fetch == ".." {
+		return true
+	}
+	return strings.HasPrefix(fetch, "../") || strings.HasPrefix(fetch, "./")
 }
 
 // GetProjectsInGroups 获取指定组中的项目
@@ -226,19 +268,19 @@ func (m *Manager) AddProject(p *Project) {
 	m.Projects = append(m.Projects, p)
 }
 
-// GetProjectsByNames 根据名称列表failed to get project
+// GetProjectsByNames 根据名称列表返回全部匹配项目。同名项目可能有多个
+// 工作树路径（如 cherry-pick 需要全部命中），因此不能遇到第一个就停止。
 func (m *Manager) GetProjectsByNames(names []string) ([]*Project, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var projects []*Project
+	projects := make([]*Project, 0, len(names))
 	for _, name := range names {
 		found := false
 		for _, p := range m.Projects {
 			if p.Name == name {
 				projects = append(projects, p)
 				found = true
-				break
 			}
 		}
 		if !found {
@@ -413,118 +455,36 @@ func (m *Manager) GetProjectsInAnyGroup(groups []string) []*Project {
 	return projects
 }
 
-// ResolveRemoteURL 解析远程URL。
-// 相对 fetch 路径（如 "../foo"）基于 manifest URL 解析（对齐上游 urljoin 语义，
-// 会规范化 "." / ".." 段），绝对 URL 原样返回。
-func (m *Manager) ResolveRemoteURL(remoteURL string) string {
+// ResolveProjectURL 返回项目的完整 clone/fetch URL：以清单原始 fetch 基址
+// （Project.FetchBase）经 urljoin 解析后，无条件拼接一次 "/"+项目名
+// （对齐上游 ToRemoteSpec：fetchUrl.rstrip('/') + '/' + name）。
+// 没有 FetchBase 的直接构造项目（RemoteURL 已是完整地址）原样返回 RemoteURL，
+// 这是唯一保留的幂等路径；绝不按项目名后缀猜测是否已经拼接。
+func (m *Manager) ResolveProjectURL(p *Project) string {
+	if p == nil {
+		return ""
+	}
+	return p.resolveFetchURL(m.ManifestURL)
+}
+
+// ResolveRemoteURL 把 remoteURL 视为 fetch/push 基址，经 urljoin 解析后
+// 无条件拼接一次项目名（对齐上游 ToRemoteSpec）。空入参返回空串；
+// 不做"已包含项目名"的后缀判断，避免把末段与项目名同名的基址误当成完整 URL。
+func (m *Manager) ResolveRemoteURL(remoteURL string, projectName ...string) string {
 	logger.Debug("解析远程URL: %s", remoteURL)
 
-	// 如果URL为空，返回空字符串
 	if remoteURL == "" {
 		return ""
 	}
 
-	// 绝对 URL（带 scheme 或 scp 风式 git@host:path）直接返回
-	if isAbsoluteRemoteURL(remoteURL) {
-		return remoteURL
+	name := ""
+	if len(projectName) > 0 {
+		name = strings.TrimSpace(projectName[0])
 	}
 
-	// 相对路径：基于 manifest URL 解析（urljoin 语义，规范化 .. / . 段）
-	if m.ManifestURL != "" {
-		if base, err := url.Parse(m.ManifestURL); err == nil {
-			if ref, rerr := url.Parse(remoteURL); rerr == nil {
-				resolved := base.ResolveReference(ref)
-				// Go 的 ResolveReference 不处理 scp 风式 URL（无 scheme），
-				// 解析结果不含 scheme 时退回字符串拼接
-				if resolved.Scheme != "" {
-					logger.Debug("解析后的URL: %s", resolved.String())
-					return resolved.String()
-				}
-			}
-		}
-	}
-
-	// 回退：字符串拼接（含 scp 风式 manifest URL 的场景）
-	baseURL := m.extractBaseURL(m.ManifestURL)
-	if baseURL == "" {
-		logger.Warn("无法%s 提取基础URL", m.ManifestURL)
-		return remoteURL
-	}
-
-	resolvedURL := baseURL
-	if !strings.HasSuffix(resolvedURL, "/") {
-		resolvedURL += "/"
-	}
-	resolvedURL += remoteURL
-
-	logger.Debug("解析后的URL: %s", resolvedURL)
-	return resolvedURL
-}
-
-// isAbsoluteRemoteURL 判断是否为绝对远程 URL：
-// 带 scheme（http(s)/git/ssh/file 等）或 scp 风式（user@host:path）
-func isAbsoluteRemoteURL(remoteURL string) bool {
-	if strings.HasPrefix(remoteURL, "http://") ||
-		strings.HasPrefix(remoteURL, "https://") ||
-		strings.HasPrefix(remoteURL, "git://") ||
-		strings.HasPrefix(remoteURL, "ssh://") ||
-		strings.HasPrefix(remoteURL, "file://") ||
-		strings.HasPrefix(remoteURL, "persistent-") {
-		return true
-	}
-	// scp 风式：user@host:path（无 scheme，含 : 且含 @）
-	return strings.Contains(remoteURL, "@") && strings.Contains(remoteURL, ":")
-}
-
-// extractBaseURL 提取基础URL
-func (m *Manager) extractBaseURL(url string) string {
-	logger.Debug("%s 提取基础URL", url)
-
-	// 处理不同格式的URL
-
-	// HTTP/HTTPS URL
-	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
-		// 移除最后一个路径组件
-		var lastSlash = strings.LastIndex(url, "/")
-		if lastSlash > 8 { // 确保不是协议后的第一个斜杠
-			return url[:lastSlash]
-		}
-		return url
-	}
-
-	// SSH URL (git@github.com:user/repo.git)
-	if strings.Contains(url, "@") && strings.Contains(url, ":") {
-		parts := strings.Split(url, ":")
-		if len(parts) == 2 {
-			host := parts[0]
-			path := parts[1]
-
-			// 移除最后一个路径组件
-			lastSlash := strings.LastIndex(path, "/")
-			if lastSlash >= 0 {
-				path = path[:lastSlash]
-			} else {
-				// 如果没有斜杠，可能是直接的仓库名
-				path = ""
-			}
-
-			if path == "" {
-				return host + ":"
-			}
-			return host + ":" + path
-		}
-	}
-
-	// 文件URL
-	if strings.HasPrefix(url, "file://") {
-		path := strings.TrimPrefix(url, "file://")
-		dir := filepath.Dir(path)
-		return "file://" + dir
-	}
-
-	// unrecognized URL format
-	logger.Warn("unrecognized URL format: %s", url)
-	return ""
+	resolved := joinProjectName(resolveBaseURL(m.ManifestURL, remoteURL), name)
+	logger.Debug("解析后的URL: %s", resolved)
+	return resolved
 }
 
 // ForEach executes an operation on each project with bounded concurrency.
@@ -611,7 +571,17 @@ func (m *Manager) ForEachWithJobs(fn func(*Project) error, jobs int) error {
 
 // Sync 同步所有项目
 func (m *Manager) Sync(opts SyncOptions) error {
-	logger.Info("开始同步%d 个项目", len(m.Projects))
+	projects := m.GetProjects()
+
+	// DryRun 只打印将要执行的动作，不 clone/fetch/checkout
+	if opts.DryRun {
+		for _, p := range projects {
+			logger.Info("dry-run: 将同步项目 %s (%s)", p.Name, p.RemoteURL)
+		}
+		return nil
+	}
+
+	logger.Info("开始同步%d 个项目", len(projects))
 
 	// 如果指定了并发数，使用ForEachWithJobs
 	if opts.Jobs > 0 {
@@ -714,7 +684,17 @@ func (m *Manager) ForEachProject(fn func(*Project) error, concurrency int) error
 
 // SyncProjects 同步所有项目，支持并发
 func (m *Manager) SyncProjects(opts SyncOptions, concurrency int) error {
-	logger.Info("开始同%d 个项目，并发 %d", len(m.Projects), concurrency)
+	projects := m.GetProjects()
+
+	// DryRun 只打印将要执行的动作，不 clone/fetch/checkout
+	if opts.DryRun {
+		for _, p := range projects {
+			logger.Info("dry-run: 将同步项目 %s (%s)", p.Name, p.RemoteURL)
+		}
+		return nil
+	}
+
+	logger.Info("开始同%d 个项目，并发 %d", len(projects), concurrency)
 
 	// 使用 ForEachProject 并发执行同步
 	err := m.ForEachProject(func(p *Project) error {
@@ -755,56 +735,26 @@ func (m *Manager) FilterProjects(filter func(*Project) bool) []*Project {
 	return filtered
 }
 
-// getMirrorProjectPath 根据远程URL的路径结构确定镜像模式下的项目路径
-func (m *Manager) getMirrorProjectPath(manifestPath, remoteURL, projectName string) string {
-	// 如果remote URL is empty，使用清单中的路径
-	if remoteURL == "" {
-		// 在镜像模式下，路径需要以.git结尾
-		path := filepath.Join(m.RepoDir, manifestPath)
-		if !strings.HasSuffix(path, ".git") {
-			path += ".git"
-		}
-		return path
+// getMirrorProjectPath 生成镜像模式下的仓库路径。
+// 对齐上游 GetProjectPaths：gitdir=objdir=<topdir>/<name>.git，其中 name
+// 含嵌套前缀（如 platform/frameworks/base -> <topdir>/platform/frameworks/base.git），
+// 镜像没有工作树。
+//   - name 仅去掉全部尾部斜杠，不剥离 ".git" 后缀（上游同款行为）；
+//   - 使用 filepath.Clean 规范化后生成镜像路径；
+//   - 返回绝对路径，作为裸仓库 Gitdir/Objdir；
+//   - name 缺失或不安全（绝对路径、.. 越界）时退回清单 path，再不行使用固定名。
+func (m *Manager) getMirrorProjectPath(manifestPath, projectName string) string {
+	name := filepath.Clean(strings.TrimRight(strings.TrimSpace(projectName), "/"))
+	if name == "" || name == "." || !filepath.IsLocal(name) {
+		name = filepath.Clean(strings.TrimRight(strings.TrimSpace(manifestPath), "/"))
+	}
+	if name == "" || name == "." || !filepath.IsLocal(name) {
+		name = "project"
 	}
 
-	// 解析远程URL，提取路径部分
-	var path string
-
-	// 处理SSH格式: user@host:path/to/repo.git
-	if strings.Contains(remoteURL, "@") && strings.Contains(remoteURL, ":") {
-		parts := strings.Split(remoteURL, ":")
-		if len(parts) == 2 {
-			path = parts[1]
-		}
-	} else if strings.HasPrefix(remoteURL, "ssh://") ||
-		strings.HasPrefix(remoteURL, "http://") ||
-		strings.HasPrefix(remoteURL, "https://") {
-		// 处理标准URL格式
-		u, err := url.Parse(remoteURL)
-		if err == nil {
-			path = u.Path
-		}
-	} else {
-		// 其他格式，直接使用URL作为路径
-		path = remoteURL
+	mirrorPath := filepath.Join(m.TopDir, name+".git")
+	if abs, err := filepath.Abs(mirrorPath); err == nil {
+		mirrorPath = abs
 	}
-
-	// 确保返回的路径是安全的，基于.repo目录。
-	// URL 解析出的路径为绝对形式（/foo/bar.git），先中和前导分隔符再校验；
-	// filepath.IsLocal 拒绝绝对路径与含 ".." 会逃逸出本目录的路径（参照
-	// internal/repo_sync/checkout.go 的同一守卫写法）。
-	cleanPath := strings.TrimPrefix(filepath.Clean(path), "/")
-	if !filepath.IsLocal(cleanPath) {
-		// 非本地安全路径时，使用项目名称作为路径
-		cleanPath = projectName
-	}
-
-	// 在镜像模式下，路径需要以.git结尾
-	if !strings.HasSuffix(cleanPath, ".git") {
-		cleanPath += ".git"
-	}
-
-	// 确保返回绝对路径，避免相对路径导致的安全问题
-	absPath := filepath.Join(m.RepoDir, cleanPath)
-	return absPath
+	return mirrorPath
 }

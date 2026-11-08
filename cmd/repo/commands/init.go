@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/leopardxu/repo-go/internal/logger"
 	"github.com/leopardxu/repo-go/internal/manifest"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // RepoConfig 表示repo配置
@@ -93,10 +96,10 @@ type InitOptions struct {
 	ConfigName             bool
 	Force                  bool // --force：跳过"覆盖已有初始化配置"的人工确认
 
-	// 内部标记：是否对清单做了合并（影响 manifest.xml 软链决策）。
-	// init 不再按组预过滤，故 Filtered 恒为 false，仅 Merged 控制是否写盘合并清单。
-	Merged   bool
-	Filtered bool // 已废弃：init 不再预过滤，恒为 false；保留以兼容字段
+	// changedFlags 记录命令行显式设置的 flag（含位置参数与环境变量注入）。
+	// re-init 时未显式指定的字段从旧 .repo/config.json 继承，避免
+	// `repo init -u URL` 把 mirror/reference/depth/groups 等重置为默认值。
+	changedFlags map[string]bool
 }
 
 // InitCmd 返回init命令
@@ -110,6 +113,12 @@ func InitCmd() *cobra.Command {
 		// 对齐上游 ValidateOptions：init 最多接受 1 个位置参数（manifest url）
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// 记录显式设置的 flag：re-init 时未显式指定的字段从旧配置继承。
+			opts.changedFlags = make(map[string]bool)
+			cmd.Flags().Visit(func(f *pflag.Flag) {
+				opts.changedFlags[f.Name] = true
+			})
+
 			// --repo-branch 是 --repo-rev 的隐藏别名（上游 dest=repo_rev, SUPPRESS_HELP）
 			if cmd.Flags().Changed("repo-branch") {
 				opts.RepoRev = opts.RepoBranch
@@ -121,17 +130,20 @@ func InitCmd() *cobra.Command {
 					return fmt.Errorf("--manifest-url option and URL argument both specified: only use one to select the manifest URL")
 				}
 				opts.ManifestURL = args[0]
+				opts.changedFlags["manifest-url"] = true
 			}
 
 			// 上游 _RegisteredEnvironmentOptions：对应 flag 未显式设置时回退到环境变量
 			if opts.ManifestURL == "" {
 				if v := os.Getenv("REPO_MANIFEST_URL"); v != "" {
 					opts.ManifestURL = v
+					opts.changedFlags["manifest-url"] = true
 				}
 			}
 			if opts.Reference == "" {
 				if v := os.Getenv("REPO_MIRROR_LOCATION"); v != "" {
 					opts.Reference = v
+					opts.changedFlags["reference"] = true
 				}
 			}
 			if !cmd.Flags().Changed("git-lfs") {
@@ -141,6 +153,7 @@ func InitCmd() *cobra.Command {
 					} else {
 						opts.GitLFS = true
 					}
+					opts.changedFlags["git-lfs"] = true
 				}
 			}
 
@@ -154,6 +167,11 @@ func InitCmd() *cobra.Command {
 				if expanded, err := expandUser(opts.Reference); err == nil {
 					opts.Reference = expanded
 				}
+			}
+
+			// 正反 flag 同时显式指定时，必须在归一化前报错
+			if err := validateChangedFlagConflicts(cmd); err != nil {
+				return err
 			}
 
 			return runInit(opts)
@@ -298,9 +316,36 @@ func promptForUserInfo(log logger.Logger) error {
 	return nil
 }
 
+// commitSHAPattern 匹配完整提交 SHA：40 位或 64 位小写十六进制。
+// 只接受完整长度，避免 "deadbeef" 之类短串被误判为提交而触发 detached checkout。
+var commitSHAPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
+// isCommitSHA 判断分支参数是否为一个提交 SHA。
+func isCommitSHA(branch string) bool {
+	return commitSHAPattern.MatchString(strings.TrimSpace(branch))
+}
+
+// ensureWithinWorkspace 校验路径位于当前工作目录内，防止误删仓库外目录。
+func ensureWithinWorkspace(dir string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get current directory: %w", err)
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve path %s: %w", dir, err)
+	}
+	relPath, err := filepath.Rel(cwd, absDir)
+	if err != nil || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path %s is not under repo root, operation refused", dir)
+	}
+	return nil
+}
+
 // cloneManifestRepo 克隆或更新清单仓库。
+// 清单仓库始终使用普通 clone：--mirror 仅作用于清单内项目仓库，裸镜像的
+// .repo/manifests 没有工作区，无法解析清单文件。
 // 使用 git -C <dir> 在指定目录执行命令，避免 os.Chdir 的线程安全问题。
-// 超时后通过 context 取消子进程，避免 goroutine 泄漏。
 func cloneManifestRepo(gitRunner git.Runner, cfg *RepoConfig) error {
 	manifestsDir := filepath.Join(".repo", "manifests")
 
@@ -318,12 +363,8 @@ func cloneManifestRepo(gitRunner git.Runner, cfg *RepoConfig) error {
 
 	// 目录存在但不是 git 仓库（可能残留），清空后重新克隆
 	if entries, err := os.ReadDir(manifestsDir); err == nil && len(entries) > 0 {
-		// 安全检查：确保要删除的目录在 repo 根目录下
-		cwd, _ := os.Getwd()
-		absManifestsDir, _ := filepath.Abs(manifestsDir)
-		relPath, relErr := filepath.Rel(cwd, absManifestsDir)
-		if relErr != nil || strings.HasPrefix(relPath, "..") {
-			return fmt.Errorf("manifests目录 %s is not under repo root, deletion refused", manifestsDir)
+		if err := ensureWithinWorkspace(manifestsDir); err != nil {
+			return err
 		}
 		if err := os.RemoveAll(manifestsDir); err != nil {
 			return fmt.Errorf("failed to clean manifests directory: %w", err)
@@ -333,17 +374,21 @@ func cloneManifestRepo(gitRunner git.Runner, cfg *RepoConfig) error {
 		}
 	}
 
-	// 构建克隆命令
-	args := []string{"clone"}
+	return cloneManifestRepoFresh(gitRunner, manifestsDir, cfg)
+}
 
-	if cfg.Mirror {
-		args = append(args, "--mirror")
-	}
-	if cfg.ManifestDepth > 0 && !cfg.Mirror {
+// cloneManifestRepoFresh 在空目录上执行清单仓库初始克隆。
+func cloneManifestRepoFresh(gitRunner git.Runner, manifestsDir string, cfg *RepoConfig) error {
+	branch := strings.TrimSpace(cfg.ManifestBranch)
+	commitSHA := isCommitSHA(branch)
+
+	args := []string{"clone"}
+	if cfg.ManifestDepth > 0 {
 		args = append(args, fmt.Sprintf("--depth=%d", cfg.ManifestDepth))
 	}
-	if cfg.ManifestBranch != "" && !cfg.Mirror {
-		args = append(args, "-b", cfg.ManifestBranch)
+	// HEAD 视为远端默认分支，不传 -b；提交 SHA 先普通 clone 再 checkout
+	if branch != "" && branch != "HEAD" && !commitSHA {
+		args = append(args, "-b", branch)
 	}
 	if cfg.Reference != "" {
 		args = append(args, fmt.Sprintf("--reference=%s", cfg.Reference))
@@ -351,10 +396,9 @@ func cloneManifestRepo(gitRunner git.Runner, cfg *RepoConfig) error {
 			args = append(args, "--dissociate")
 		}
 	}
-	if cfg.PartialClone && !cfg.Mirror {
+	if cfg.PartialClone {
 		args = append(args, "--filter="+cfg.CloneFilter)
 	}
-
 	args = append(args, cfg.ManifestURL, manifestsDir)
 
 	// 使用带超时的 context 执行克隆，避免 goroutine 泄漏
@@ -399,29 +443,370 @@ func cloneManifestRepo(gitRunner git.Runner, cfg *RepoConfig) error {
 		}
 	}
 
+	// -b HEAD：解析克隆后的默认分支并记录到配置
+	if branch == "HEAD" {
+		if resolved, err := resolveDefaultBranch(gitRunner, manifestsDir); err == nil && resolved != "" {
+			cfg.ManifestBranch = resolved
+		}
+	}
+
+	// -b <commit SHA>：先 clone，再 fetch 指定 upstream ref 并 checkout 该提交
+	if commitSHA {
+		if err := fetchManifestUpstreamRef(gitRunner, manifestsDir, cfg); err != nil {
+			return err
+		}
+		if _, err := gitRunner.RunInDir(manifestsDir, "checkout", branch); err != nil {
+			return fmt.Errorf("failed to checkout manifest commit %s: %w", branch, err)
+		}
+	}
+
 	return nil
 }
 
-// updateExistingManifestRepo 对已存在的清单仓库执行 fetch + checkout 更新。
+// fetchManifestUpstreamRef 在清单仓库中获取 --manifest-upstream-branch 指定的
+// ref，供提交 SHA checkout 使用（该选项此前完全未被读取）。
+func fetchManifestUpstreamRef(gitRunner git.Runner, manifestsDir string, cfg *RepoConfig) error {
+	upstream := strings.TrimSpace(cfg.ManifestUpstreamBranch)
+	if upstream == "" {
+		return nil
+	}
+	refspec := fmt.Sprintf("refs/heads/%s:refs/remotes/origin/%s", upstream, upstream)
+	fetchArgs := []string{"fetch"}
+	if cfg.ManifestDepth > 0 {
+		fetchArgs = append(fetchArgs, fmt.Sprintf("--depth=%d", cfg.ManifestDepth))
+	}
+	fetchArgs = append(fetchArgs, "origin", refspec)
+	if _, err := gitRunner.RunInDir(manifestsDir, fetchArgs...); err != nil {
+		// 兼容 upstream 以 ref/sha 形式给出（非分支名）
+		if _, ferr := gitRunner.RunInDir(manifestsDir, "fetch", "origin", upstream); ferr != nil {
+			return fmt.Errorf("failed to fetch manifest upstream ref %q: %w", upstream, err)
+		}
+	}
+	return nil
+}
+
+// resolveRemoteDefaultBranch 使用 ls-remote --symref 直接向远端解析默认分支。
+// 换 URL 后本地的 refs/remotes/origin/HEAD 可能仍指向旧仓库的分支，因此
+// fetch 之后必须询问远端，而不是读旧 origin/HEAD。
+func resolveRemoteDefaultBranch(gitRunner git.Runner, dir, url string) (string, error) {
+	if strings.TrimSpace(url) == "" {
+		return "", fmt.Errorf("manifest URL is empty")
+	}
+	out, err := gitRunner.RunInDir(dir, "ls-remote", "--symref", url, "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("failed to query remote default branch: %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		// 形如 "ref: refs/heads/main\tHEAD"
+		if !strings.HasPrefix(line, "ref:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.HasPrefix(fields[1], "refs/heads/") {
+			return strings.TrimPrefix(fields[1], "refs/heads/"), nil
+		}
+	}
+	return "", fmt.Errorf("remote %s did not advertise a default branch", url)
+}
+
+// resolveDefaultBranch 解析清单仓库的远端默认分支（-b HEAD 语义）。
+func resolveDefaultBranch(gitRunner git.Runner, manifestsDir string) (string, error) {
+	if out, err := gitRunner.RunInDir(manifestsDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		branch := strings.TrimSpace(string(out))
+		if branch != "" {
+			return strings.TrimPrefix(branch, "origin/"), nil
+		}
+	}
+	out, err := gitRunner.RunInDir(manifestsDir, "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// normalizeHeadManifestBranch 将 -b HEAD 归一化为清单仓库 origin/HEAD 指向的
+// 实际分支。diffInitConfig 比较前使用该值，保证同一条 `repo init -b HEAD`
+// 命令重复执行时不因 "HEAD" vs 实际分支而被要求确认。仓库尚未克隆时原样返回，
+// 由 clone 阶段解析。
+func normalizeHeadManifestBranch(runner git.Runner, manifestsDir, branch string) string {
+	if strings.TrimSpace(branch) != "HEAD" {
+		return branch
+	}
+	if _, err := os.Stat(filepath.Join(manifestsDir, ".git")); err != nil {
+		return branch
+	}
+	resolved, err := resolveDefaultBranch(runner, manifestsDir)
+	if err != nil || resolved == "" {
+		return branch
+	}
+	return resolved
+}
+
+// loadExistingRepoConfig 读取现有 .repo/config.json（用于判断克隆参数是否变化）。
+func loadExistingRepoConfig(manifestsDir string) (*RepoConfig, bool) {
+	configPath := filepath.Join(filepath.Dir(manifestsDir), "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, false
+	}
+	var cfg RepoConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, false
+	}
+	return &cfg, true
+}
+
+// flagChanged 判断 flag 是否被显式设置（含位置参数/环境变量）。
+func (o *InitOptions) flagChanged(name string) bool {
+	return o.changedFlags != nil && o.changedFlags[name]
+}
+
+// flagTouched 判断任一同义 flag（如正/反 flag 对）是否被显式设置。
+func (o *InitOptions) flagTouched(names ...string) bool {
+	for _, name := range names {
+		if o.flagChanged(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyRepoConfigInheritance 将旧配置中“本次未显式指定”的字段继承到 opts。
+// 这是 re-init 幂等的关键：`repo init -u URL` 在已初始化客户端上不得把
+// mirror/reference/depth/groups 等重置为 flag 默认值或强制重克隆。
+func applyRepoConfigInheritance(opts *InitOptions, old *RepoConfig) {
+	if old == nil {
+		return
+	}
+	inheritString := func(changed bool, dst *string, src string) {
+		if !changed && src != "" {
+			*dst = src
+		}
+	}
+	inheritBool := func(changed bool, dst *bool, src bool) {
+		if !changed {
+			*dst = src
+		}
+	}
+	inheritInt := func(changed bool, dst *int, src int) {
+		if !changed {
+			*dst = src
+		}
+	}
+
+	inheritString(opts.flagTouched("manifest-url"), &opts.ManifestURL, old.ManifestURL)
+	inheritString(opts.flagTouched("manifest-branch"), &opts.ManifestBranch, old.ManifestBranch)
+	inheritString(opts.flagTouched("manifest-upstream-branch"), &opts.ManifestUpstreamBranch, old.ManifestUpstreamBranch)
+	inheritString(opts.flagTouched("manifest-name"), &opts.ManifestName, old.ManifestName)
+	// groups 需要区分“未指定”与“显式空串”：未显式 -g 时原样继承旧值
+	// （即使为空），显式 -g "" 则保留空串，不能回落到默认 "default"。
+	if !opts.flagTouched("groups") {
+		opts.Groups = old.Groups
+	}
+	inheritString(opts.flagTouched("platform"), &opts.Platform, old.Platform)
+
+	inheritBool(opts.flagTouched("mirror"), &opts.Mirror, old.Mirror)
+	inheritBool(opts.flagTouched("archive"), &opts.Archive, old.Archive)
+	inheritBool(opts.flagTouched("worktree"), &opts.Worktree, old.Worktree)
+	inheritBool(opts.flagTouched("use-local-gitdirs"), &opts.UseLocalGitdirs, old.UseLocalGitdirs)
+	inheritString(opts.flagTouched("reference"), &opts.Reference, old.Reference)
+	inheritBool(opts.flagTouched("no-smart-cache"), &opts.NoSmartCache, old.NoSmartCache)
+	inheritBool(opts.flagTouched("dissociate"), &opts.Dissociate, old.Dissociate)
+	inheritInt(opts.flagTouched("depth"), &opts.Depth, old.Depth)
+	inheritInt(opts.flagTouched("manifest-depth"), &opts.ManifestDepth, old.ManifestDepth)
+
+	inheritBool(opts.flagTouched("partial-clone", "no-partial-clone"), &opts.PartialClone, old.PartialClone)
+	inheritString(opts.flagTouched("partial-clone-exclude"), &opts.PartialCloneExclude, old.PartialCloneExclude)
+	inheritString(opts.flagTouched("clone-filter"), &opts.CloneFilter, old.CloneFilter)
+	inheritBool(opts.flagTouched("use-superproject", "no-use-superproject"), &opts.UseSuperproject, old.UseSuperproject)
+	inheritBool(opts.flagTouched("clone-bundle", "no-clone-bundle"), &opts.CloneBundle, old.CloneBundle)
+	inheritBool(opts.flagTouched("git-lfs", "no-git-lfs"), &opts.GitLFS, old.GitLFS)
+
+	inheritString(opts.flagTouched("repo-url"), &opts.RepoURL, old.RepoURL)
+	inheritString(opts.flagTouched("repo-rev", "repo-branch"), &opts.RepoRev, old.RepoRev)
+	inheritBool(opts.flagTouched("no-repo-verify"), &opts.NoRepoVerify, old.NoRepoVerify)
+	inheritBool(opts.flagTouched("standalone-manifest"), &opts.StandaloneManifest, old.StandaloneManifest)
+	inheritBool(opts.flagTouched("submodules"), &opts.Submodules, old.Submodules)
+	inheritBool(opts.flagTouched("current-branch", "no-current-branch"), &opts.CurrentBranch, old.CurrentBranch)
+	inheritBool(opts.flagTouched("tags", "no-tags"), &opts.Tags, old.Tags)
+}
+
+// discardInheritedModeConflicts 在继承旧配置后、validateOptions 之前清理
+// 与新显式选项冲突的“继承值”。只有本次显式设置的模式开关才触发丢弃，
+// 且绝不丢弃同样被显式设置的选项——那样真正的命令行冲突仍由
+// validateOptions 报错，而不会因为继承的历史配置把用户的新选择废掉。
+func discardInheritedModeConflicts(opts *InitOptions) {
+	clearInherited := func(dst *bool, names ...string) {
+		if !opts.flagTouched(names...) {
+			*dst = false
+		}
+	}
+
+	if opts.Mirror && opts.flagChanged("mirror") {
+		clearInherited(&opts.Archive, "archive")
+		clearInherited(&opts.PartialClone, "partial-clone", "no-partial-clone")
+		clearInherited(&opts.Worktree, "worktree")
+		clearInherited(&opts.UseLocalGitdirs, "use-local-gitdirs")
+		clearInherited(&opts.UseSuperproject, "use-superproject", "no-use-superproject")
+	}
+	if opts.Archive && opts.flagChanged("archive") {
+		clearInherited(&opts.Mirror, "mirror")
+		clearInherited(&opts.UseSuperproject, "use-superproject", "no-use-superproject")
+		clearInherited(&opts.UseLocalGitdirs, "use-local-gitdirs")
+	}
+	if opts.Worktree && opts.flagChanged("worktree") {
+		clearInherited(&opts.Mirror, "mirror")
+		clearInherited(&opts.UseLocalGitdirs, "use-local-gitdirs")
+	}
+	if opts.UseLocalGitdirs && opts.flagChanged("use-local-gitdirs") {
+		clearInherited(&opts.Mirror, "mirror")
+		clearInherited(&opts.Archive, "archive")
+		clearInherited(&opts.Worktree, "worktree")
+	}
+	if opts.PartialClone && opts.flagTouched("partial-clone", "no-partial-clone") {
+		clearInherited(&opts.Mirror, "mirror")
+	}
+	if opts.UseSuperproject && opts.flagTouched("use-superproject", "no-use-superproject") {
+		clearInherited(&opts.Mirror, "mirror")
+		clearInherited(&opts.Archive, "archive")
+	}
+	if opts.StandaloneManifest && opts.flagChanged("standalone-manifest") {
+		// standalone 与 manifest-branch / 非默认 manifest-name 互斥；
+		// 显式选择 standalone 时丢弃继承来的冲突值。
+		if !opts.flagTouched("manifest-branch") {
+			opts.ManifestBranch = ""
+		}
+		if !opts.flagTouched("manifest-upstream-branch") {
+			opts.ManifestUpstreamBranch = ""
+		}
+		if !opts.flagTouched("manifest-name") {
+			opts.ManifestName = "default.xml"
+		}
+	}
+}
+
+// deriveCloneBundle 在继承完成后重新应用上游推导：
+// partial clone 开启且未显式设置 clone-bundle 时默认关闭 clone bundle。
+func deriveCloneBundle(opts *InitOptions) {
+	if opts.PartialClone && !opts.flagTouched("clone-bundle", "no-clone-bundle") {
+		opts.CloneBundle = false
+	}
+}
+
+// resolveEffectiveGroups 计算本次 init 最终写入配置的 groups：
+//   - 首次初始化，或本次显式指定 -p/--platform 或 -g/--groups 时，按平台
+//     语义重建 platform-* 组；
+//   - 普通 re-init 原样继承旧 Groups，保留用户手写的 platform 组，避免
+//     每次 init 都按 --platform 默认值重写。
+func resolveEffectiveGroups(opts *InitOptions, initialized bool) (string, error) {
+	if initialized && !opts.flagTouched("platform", "groups") {
+		return initNormalizeEffectiveGroups(opts.Groups), nil
+	}
+	groups, err := mergePlatformGroups(opts.Groups, opts.Platform, opts.Mirror, opts.flagChanged("groups"))
+	if err != nil {
+		return "", err
+	}
+	return initNormalizeEffectiveGroups(groups), nil
+}
+
+// initNormalizeEffectiveGroups 保证写入配置的 groups 非空：空值归一为 "default"，
+// 与 (*config.Config).EffectiveGroups 的空值回退语义一致，避免 config.json
+// 落盘空组后各命令解析清单时行为不一致（上游未配置组时按 default 解析）。
+func initNormalizeEffectiveGroups(groups string) string {
+	if strings.TrimSpace(groups) == "" {
+		return "default"
+	}
+	return groups
+}
+
+// manifestCloneParamsChanged 判断会影响清单仓库克隆方式的参数是否变化。
+// 变化时必须安全重克隆，否则浅克隆/部分克隆/引用仓库等状态无法就地调整。
+func manifestCloneParamsChanged(oldCfg, newCfg RepoConfig) bool {
+	if oldCfg.ManifestDepth != newCfg.ManifestDepth {
+		return true
+	}
+	if oldCfg.PartialClone != newCfg.PartialClone {
+		return true
+	}
+	if oldCfg.PartialClone && oldCfg.CloneFilter != newCfg.CloneFilter {
+		return true
+	}
+	if oldCfg.Reference != newCfg.Reference {
+		return true
+	}
+	if oldCfg.Dissociate != newCfg.Dissociate {
+		return true
+	}
+	return false
+}
+
+// updateExistingManifestRepo 对已存在的清单仓库执行 URL 校正 + fetch + checkout。
 // 使用 git -C <dir> 避免线程不安全的 os.Chdir。
 // 对齐上游 Sync_LocalHalf 语义：checkout 后 reset --hard 到已获取的远程顶端，
 // 否则 re-init 会停留在本地旧提交，manifest.xml 永远是陈旧内容。
 func updateExistingManifestRepo(gitRunner git.Runner, manifestsDir string, cfg *RepoConfig) error {
+	// 克隆方式参数变化：在确认路径安全后重克隆
+	if oldCfg, ok := loadExistingRepoConfig(manifestsDir); ok && manifestCloneParamsChanged(*oldCfg, *cfg) {
+		return recloneManifestRepo(gitRunner, manifestsDir, cfg)
+	}
+
+	// origin URL 与配置不一致时校正，避免 config 新 URL + origin 旧 URL
+	if cfg.ManifestURL != "" {
+		out, err := gitRunner.RunInDir(manifestsDir, "config", "--get", "remote.origin.url")
+		currentURL := strings.TrimSpace(string(out))
+		if err != nil || currentURL == "" {
+			if _, aerr := gitRunner.RunInDir(manifestsDir, "remote", "add", "origin", cfg.ManifestURL); aerr != nil {
+				return fmt.Errorf("failed to add manifest origin remote: %w", aerr)
+			}
+		} else if currentURL != cfg.ManifestURL {
+			if _, serr := gitRunner.RunInDir(manifestsDir, "remote", "set-url", "origin", cfg.ManifestURL); serr != nil {
+				return fmt.Errorf("failed to update manifest origin URL: %w", serr)
+			}
+		}
+	}
+
 	// fetch 更新
 	if _, err := gitRunner.RunInDir(manifestsDir, "fetch", "--all"); err != nil {
 		return fmt.Errorf("failed to fetch manifest repository: %w", err)
 	}
 
-	// mirror 模式没有 working directory，不需要 checkout
-	if cfg.Mirror {
+	// 提交 SHA：fetch 指定 upstream ref 后 checkout（可能为 detached HEAD）
+	if isCommitSHA(cfg.ManifestBranch) {
+		if err := fetchManifestUpstreamRef(gitRunner, manifestsDir, cfg); err != nil {
+			return err
+		}
+		if _, err := gitRunner.RunInDir(manifestsDir, "checkout", strings.TrimSpace(cfg.ManifestBranch)); err != nil {
+			return fmt.Errorf("failed to checkout manifest commit %s: %w", cfg.ManifestBranch, err)
+		}
 		return nil
 	}
 
 	// 未指定分支：无法确定目标 ref，仅完成 fetch（保持当前分支）
-	if cfg.ManifestBranch == "" {
+	branch := strings.TrimSpace(cfg.ManifestBranch)
+	if branch == "" {
 		return nil
 	}
-	branch := cfg.ManifestBranch
+	// -b HEAD：fetch 后直接向远端解析默认分支。换 URL 时本地
+	// refs/remotes/origin/HEAD 可能仍指向旧仓库分支，不能依赖它。
+	if branch == "HEAD" {
+		resolved, err := resolveRemoteDefaultBranch(gitRunner, manifestsDir, cfg.ManifestURL)
+		if err != nil {
+			if cfg.ManifestURL != "" {
+				return fmt.Errorf("failed to resolve default manifest branch: %w", err)
+			}
+			// 没有 URL（极端情况）时退回本地 origin/HEAD
+			resolved, err = resolveDefaultBranch(gitRunner, manifestsDir)
+			if err != nil {
+				return fmt.Errorf("failed to resolve default manifest branch: %w", err)
+			}
+		}
+		if resolved == "" {
+			return fmt.Errorf("failed to resolve default manifest branch: remote returned empty branch")
+		}
+		branch = resolved
+		cfg.ManifestBranch = resolved
+	}
 	remoteRef := "refs/remotes/origin/" + branch
 
 	// 远程跟踪分支缺失时按显式 refspec 补取：clone -b 产生的单分支 refspec
@@ -452,6 +837,105 @@ func updateExistingManifestRepo(gitRunner git.Runner, manifestsDir string, cfg *
 	}
 	if _, err := gitRunner.RunInDir(manifestsDir, "reset", "--hard", remoteRef); err != nil {
 		return fmt.Errorf("failed to reset branch %s to %s: %w", branch, remoteRef, err)
+	}
+	return nil
+}
+
+// recloneManifestRepo 安全地删除并重新克隆清单仓库（路径必须在 workspace 内）。
+func recloneManifestRepo(gitRunner git.Runner, manifestsDir string, cfg *RepoConfig) error {
+	if err := ensureWithinWorkspace(manifestsDir); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(manifestsDir); err != nil {
+		return fmt.Errorf("failed to remove manifests directory for reclone: %w", err)
+	}
+	if err := os.MkdirAll(manifestsDir, 0755); err != nil {
+		return fmt.Errorf("failed to recreate manifests directory: %w", err)
+	}
+	return cloneManifestRepo(gitRunner, cfg)
+}
+
+// allPlatformNames 是 --platform 支持的具体平台组（对齐上游 platformize 列表）。
+var allPlatformNames = []string{"linux", "darwin", "windows"}
+
+// mergePlatformGroups 按上游语义把 --platform 合并进有效组：
+//   - auto：非 mirror 时追加 platform-<host OS>（mirror 模式上游不追加）；
+//   - all：追加 platform-linux/darwin/windows；
+//   - none：不追加；
+//   - 具体平台：追加 platform-<x>，非法值报错。
+//
+// preserveExplicitPlatform 为 true 时保留 groups 中用户显式输入的 platform-*
+// 组（只补不删）；为 false 时先剔除全部 platform-* 再按 --platform 追加——
+// 这用于清理从旧 config 继承的过期平台组，避免重复 init 累积或残留平台组。
+func mergePlatformGroups(groups, platform string, mirror, preserveExplicitPlatform bool) (string, error) {
+	name := strings.TrimSpace(platform)
+	if name == "" {
+		name = "auto"
+	}
+
+	parts := manifest.SplitGroups(groups)
+	filtered := make([]string, 0, len(parts)+len(allPlatformNames))
+	for _, g := range parts {
+		if preserveExplicitPlatform || !strings.HasPrefix(g, "platform-") {
+			filtered = append(filtered, g)
+		}
+	}
+
+	switch name {
+	case "auto":
+		if !mirror {
+			filtered = append(filtered, "platform-"+runtime.GOOS)
+		}
+	case "all":
+		for _, p := range allPlatformNames {
+			filtered = append(filtered, "platform-"+p)
+		}
+	case "none":
+		// 不追加任何平台组
+	default:
+		valid := false
+		for _, p := range allPlatformNames {
+			if p == name {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return "", fmt.Errorf("invalid platform flag: %q", platform)
+		}
+		filtered = append(filtered, "platform-"+name)
+	}
+
+	// 去重并保留首次出现顺序
+	seen := make(map[string]bool, len(filtered))
+	out := make([]string, 0, len(filtered))
+	for _, g := range filtered {
+		if g == "" || seen[g] {
+			continue
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	return strings.Join(out, ","), nil
+}
+
+// validateChangedFlagConflicts 检查正反 flag 是否被同时显式指定。
+// 必须在 applyNegationFlags 之前执行：归一化会把正 flag 的默认 true 置为
+// false，从而掩盖"两个 flag 都显式给出"的冲突。
+func validateChangedFlagConflicts(cmd *cobra.Command) error {
+	pairs := [][2]string{
+		{"current-branch", "no-current-branch"},
+		{"tags", "no-tags"},
+		{"partial-clone", "no-partial-clone"},
+		{"use-superproject", "no-use-superproject"},
+		{"clone-bundle", "no-clone-bundle"},
+		{"git-lfs", "no-git-lfs"},
+		{"outer-manifest", "no-outer-manifest"},
+	}
+	for _, pair := range pairs {
+		if cmd.Flags().Changed(pair[0]) && cmd.Flags().Changed(pair[1]) {
+			return fmt.Errorf("cannot specify both --%s and --%s", pair[0], pair[1])
+		}
 	}
 	return nil
 }
@@ -489,6 +973,11 @@ func validateOptions(opts *InitOptions) error {
 	// manifest-upstream-branch 必须配合 manifest-branch
 	if opts.ManifestUpstreamBranch != "" && opts.ManifestBranch == "" {
 		return fmt.Errorf("--manifest-upstream-branch cannot be used without --manifest-branch")
+	}
+
+	// --platform 合法性（非法值直接报错）
+	if _, err := mergePlatformGroups(opts.Groups, opts.Platform, opts.Mirror, opts.flagChanged("groups")); err != nil {
+		return err
 	}
 
 	// 正反 flag 互斥
@@ -583,16 +1072,31 @@ type configFieldDiff struct {
 // 克隆调优类选项（depth/dissociate 等）不纳入，避免刷新调优参数时反复确认。
 func diffInitConfig(existing RepoConfig, opts *InitOptions) []configFieldDiff {
 	var diffs []configFieldDiff
-	add := func(name, oldVal, newVal string) {
+	// opts.changedFlags 非 nil 时只比较显式指定的字段：未指定字段在 re-init
+	// 中从旧配置继承，不应触发覆盖确认（等价于“同一条命令重复执行不确认”）。
+	// 测试可通过 nil map 关闭该过滤，直接比较值。
+	add := func(flags []string, name, oldVal, newVal string) {
+		if opts.changedFlags != nil {
+			touched := false
+			for _, flag := range flags {
+				if opts.changedFlags[flag] {
+					touched = true
+					break
+				}
+			}
+			if !touched {
+				return
+			}
+		}
 		if oldVal != newVal {
 			diffs = append(diffs, configFieldDiff{name: name, existing: oldVal, current: newVal})
 		}
 	}
-	add("manifest-url", existing.ManifestURL, opts.ManifestURL)
-	add("manifest-branch", existing.ManifestBranch, opts.ManifestBranch)
-	add("manifest-name", existing.ManifestName, opts.ManifestName)
-	add("groups", existing.Groups, opts.Groups)
-	add("platform", existing.Platform, opts.Platform)
+	add([]string{"manifest-url"}, "manifest-url", existing.ManifestURL, opts.ManifestURL)
+	add([]string{"manifest-branch"}, "manifest-branch", existing.ManifestBranch, opts.ManifestBranch)
+	add([]string{"manifest-name"}, "manifest-name", existing.ManifestName, opts.ManifestName)
+	add([]string{"groups"}, "groups", existing.Groups, opts.Groups)
+	add([]string{"platform"}, "platform", existing.Platform, opts.Platform)
 	return diffs
 }
 
@@ -673,14 +1177,47 @@ func runInit(opts *InitOptions) error {
 
 	log.Debug("初始化repo 客户端..")
 
+	// 归一化 --no-* 否定 flag：必须在 validateOptions 之前，否则
+	// --no-current-branch / --no-clone-bundle（正 flag 默认 true）会被
+	// 误判为"正反同时指定"而永久报错。
+	applyNegationFlags(opts)
+
+	// re-init 时未显式指定的字段从旧 .repo/config.json 继承：避免
+	// `repo init -u URL` 重置 mirror/reference/depth/groups 等并强制重克隆。
+	oldCfg, initialized := loadExistingRepoConfig(filepath.Join(".repo", "manifests"))
+	if initialized {
+		applyRepoConfigInheritance(opts, oldCfg)
+	}
+
+	// 继承值可能与本轮显式选择的模式冲突（例如旧配置 mirror=true，
+	// 本次显式 --partial-clone）：丢弃冲突的继承值，再交给 validateOptions。
+	discardInheritedModeConflicts(opts)
+	// 继承完成后重新应用 partial-clone ⇒ clone-bundle=false 推导。
+	deriveCloneBundle(opts)
+
+	// -b HEAD 归一化为实际分支，保证重复执行同一条命令时 diffInitConfig
+	// 不误判为配置变化。仅在清单 URL 未变化时使用本地 origin/HEAD；
+	// 换 URL 后旧 origin/HEAD 可能指向旧仓库，保持 HEAD 交由 clone/fetch
+	// 阶段用 ls-remote --symref 解析。
+	urlUnchanged := !initialized || oldCfg == nil || oldCfg.ManifestURL == opts.ManifestURL
+	if initialized && urlUnchanged {
+		opts.ManifestBranch = normalizeHeadManifestBranch(git.NewRunner(), filepath.Join(".repo", "manifests"), opts.ManifestBranch)
+	}
+
+	// 按上游语义把 --platform 合并进有效组（写入 cfg.Groups，cfg.Platform 保留原值）。
+	// 仅首次初始化或本次显式 -p/-g 时重建 platform-*；普通 re-init 原样继承。
+	mergedGroups, err := resolveEffectiveGroups(opts, initialized)
+	if err != nil {
+		log.Error("平台选项验证failed: %v", err)
+		return err
+	}
+	opts.Groups = mergedGroups
+
 	// 验证选项冲突
 	if err := validateOptions(opts); err != nil {
 		log.Error("选项验证failed: %v", err)
 		return err
 	}
-
-	// 归一化 --no-* 否定 flag：单独传反 flag 时置零正 flag 默认值
-	applyNegationFlags(opts)
 
 	// 告警尚未实现/不适用的选项（不中断）
 	warnUnsupported(opts, log)
@@ -797,100 +1334,14 @@ func runInit(opts *InitOptions) error {
 	}
 	log.Info("清单文件解析成功，包含 %d 个项目", len(manifestObj.Projects))
 
-	// 不在此按组过滤并固化写盘：上游 repo init 保留完整清单（含所有 include 项目），
-	// 组过滤交给 sync 时按 -g / 配置动态执行。预过滤会把非默认组（如 groups="cix"）
-	// 的项目在 init 阶段删除，导致后续 sync 始终为空。opts.Groups 仅写入配置供 sync 读取。
-
-	// 处理include标签
-	if len(manifestObj.Includes) > 0 && !opts.ThisManifestOnly {
-		log.Debug("处理 %d 个包含的清单文件", len(manifestObj.Includes))
-
-		// 创建清单合并
-		merger := manifest.NewMerger(parser, filepath.Join(".repo", "manifests"))
-
-		// 加载所有包含的清单
-		includedManifests := []*manifest.Manifest{manifestObj}
-
-		for _, include := range manifestObj.Includes {
-			includePath := filepath.Join(".repo", "manifests", include.Name)
-			log.Debug("加载包含的清单 %s", include.Name)
-
-			// 检查包含的清单文件是否存在
-			if _, err := os.Stat(includePath); os.IsNotExist(err) {
-				log.Error("included manifest file does not exist: %s", includePath)
-				return fmt.Errorf("included manifest file does not exist: %s", includePath)
-			}
-
-			// 解析包含清单时不传组过滤（nil），保留全部项目；组过滤由 sync 执行
-			includeManifest, err := parser.ParseFromFile(includePath, nil)
-			if err != nil {
-				log.Error("failed to parse included manifest%s failed: %v", include.Name, err)
-				return fmt.Errorf("failed to parse included manifest%s failed: %w", include.Name, err)
-			}
-
-			if includeManifest == nil {
-				log.Error("包含的清单文件 %s 解析结果为空", include.Name)
-				return fmt.Errorf("包含的清单文件 %s 解析结果为空", include.Name)
-			}
-
-			log.Debug("包含的清单 %s 包含 %d 个项目", include.Name, len(includeManifest.Projects))
-
-			includedManifests = append(includedManifests, includeManifest)
-		}
-
-		// 合并清单
-		log.Info("合并 %d 个清单文件", len(includedManifests))
-
-		mergedManifest, err := merger.Merge(includedManifests)
-		if err != nil {
-			log.Error("failed to merge manifests: %v", err)
-			return fmt.Errorf("failed to merge manifests: %w", err)
-		}
-
-		// 更新清单对象
-		manifestObj = mergedManifest
-
-		log.Info("合并后的清单包含 %d 个项目", len(manifestObj.Projects))
-		opts.Merged = true
-
-		// Remove existing manifest.xml if it is a symlink (legacy from old repo-go versions).
-		// If left as a symlink, WriteFile would follow it and overwrite the manifests git repo file.
-		mergedPath := filepath.Join(".repo", "manifest.xml")
-		if fi, err := os.Lstat(mergedPath); err == nil && (fi.Mode()&os.ModeSymlink != 0) {
-			os.Remove(mergedPath)
-		}
-		log.Debug("保存合并后的清单到 %s", mergedPath)
-		mergedData, err := manifestObj.ToXML()
-		if err != nil {
-			log.Error("failed to convert merged manifest to XML: %v", err)
-			return fmt.Errorf("failed to convert merged manifest to XML: %w", err)
-		}
-
-		if err := os.WriteFile(mergedPath, []byte(mergedData), 0644); err != nil {
-			log.Error("failed to write merged manifest file: %v", err)
-			return fmt.Errorf("failed to write merged manifest file: %w", err)
-		}
-
-		log.Debug("已将合并后的清单保存到 %s", mergedPath)
-	} else {
-		// 无 include：直接把解析出的清单（完整、未过滤）写入 .repo/manifest.xml
-		// Remove existing manifest.xml if it is a symlink (legacy from old repo-go versions).
-		mergedPath := filepath.Join(".repo", "manifest.xml")
-		if fi, err := os.Lstat(mergedPath); err == nil && (fi.Mode()&os.ModeSymlink != 0) {
-			os.Remove(mergedPath)
-		}
-		log.Debug("保存清单到 %s", mergedPath)
-		mergedData, err := manifestObj.ToXML()
-		if err != nil {
-			log.Error("failed to convert manifest to XML: %v", err)
-			return fmt.Errorf("failed to convert manifest to XML: %w", err)
-		}
-		if err := os.WriteFile(mergedPath, []byte(mergedData), 0644); err != nil {
-			log.Error("failed to write manifest file: %v", err)
-			return fmt.Errorf("failed to write manifest file: %w", err)
-		}
-		log.Info("已将清单保存到 %s", mergedPath)
+	// init 保留完整清单（ParseFromFile 已展开 include 并把其项目合并进
+	// Projects），不在此按组预过滤；组过滤交给 sync 按 -g/配置动态执行。
+	// 写盘前清空 Includes，输出扁平清单，避免二次解析/合并导致项目丢失。
+	if err := writeManifestXML(manifestObj, log); err != nil {
+		log.Error("failed to write manifest file: %v", err)
+		return err
 	}
+	log.Info("已将清单保存到 %s", filepath.Join(".repo", "manifest.xml"))
 
 	// 保存配置
 	log.Info("保存 repo 配置...")
@@ -899,15 +1350,12 @@ func runInit(opts *InitOptions) error {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	// 处理多清单选项
+	// 处理多清单选项：外部清单合并后重写扁平清单
 	if opts.OuterManifest {
-		// 实现加载外部清单的逻辑
 		log.Debug("加载外部清单...")
 
-		// 查找外部清单
 		outerManifestPath := filepath.Join("..", ".repo", "manifest.xml")
 		if _, err := os.Stat(outerManifestPath); err == nil {
-			// 加载外部清单
 			log.Debug("解析外部清单: %s", outerManifestPath)
 			outerManifest, err := parser.ParseFromFile(outerManifestPath, nil)
 			if err != nil {
@@ -915,7 +1363,6 @@ func runInit(opts *InitOptions) error {
 				return fmt.Errorf("failed to parse outer manifest: %w", err)
 			}
 
-			// 合并外部清单
 			log.Debug("合并外部清单...")
 			merger := manifest.NewMerger(parser, filepath.Join(".repo"))
 			mergedManifest, err := merger.Merge([]*manifest.Manifest{outerManifest, manifestObj})
@@ -923,22 +1370,11 @@ func runInit(opts *InitOptions) error {
 				log.Error("合并外部清单failed: %v", err)
 				return fmt.Errorf("failed to merge with outer manifest: %w", err)
 			}
-
-			// 更新清单对象
 			manifestObj = mergedManifest
 
-			// 保存合并后的清单
-			mergedPath := filepath.Join(".repo", "manifest.xml")
-			log.Debug("保存合并后的清单到 %s", mergedPath)
-			mergedData, err := manifestObj.ToXML()
-			if err != nil {
-				log.Error("failed to convert merged manifest to XML: %v", err)
-				return fmt.Errorf("failed to convert merged manifest to XML: %w", err)
-			}
-
-			if err := os.WriteFile(mergedPath, []byte(mergedData), 0644); err != nil {
+			if err := writeManifestXML(manifestObj, log); err != nil {
 				log.Error("failed to write merged manifest file: %v", err)
-				return fmt.Errorf("failed to write merged manifest: %w", err)
+				return err
 			}
 			log.Info("外部清单合并成功")
 		} else {
@@ -946,89 +1382,65 @@ func runInit(opts *InitOptions) error {
 		}
 	}
 
+	// --this-manifest-only：include 已在解析期展开，这里仅记录语义选择
 	if opts.ThisManifestOnly {
-		// 实现仅处理当前清单的逻辑
 		log.Debug("仅处理当前清单")
-		// 移除所有include标签
-		manifestObj.Includes = nil
-	}
-
-	if opts.AllManifests {
-		// 实现处理所有清单的逻辑
-		log.Debug("处理所有清单")
-		// 确保处理所有include标签
-		if len(manifestObj.Includes) > 0 && !opts.ThisManifestOnly {
-			merger := manifest.NewMerger(parser, filepath.Join(".repo", "manifests"))
-			includedManifests := []*manifest.Manifest{manifestObj}
-
-			for _, include := range manifestObj.Includes {
-				includePath := filepath.Join(".repo", "manifests", include.Name)
-				log.Debug("加载包含的清单 %s", include.Name)
-
-				includeManifest, err := parser.ParseFromFile(includePath, nil)
-				if err != nil {
-					log.Error("failed to parse included manifest%s failed: %v", include.Name, err)
-					return fmt.Errorf("failed to parse included manifest %s: %w", include.Name, err)
-				}
-
-				includedManifests = append(includedManifests, includeManifest)
-			}
-
-			// 合并清单：合并结果本身不再被后续逻辑消费（manifest.xml 已在
-			// 前面写出），此处调用仅用于校验合并是否成功，失败即返回错误
-			log.Debug("合并所有清单..")
-			if _, err := merger.Merge(includedManifests); err != nil {
-				log.Error("failed to merge manifests: %v", err)
-				return fmt.Errorf("failed to merge manifests: %w", err)
-			}
-			log.Info("所有清单合并成功")
-		}
 	}
 
 	log.Debug("Repo 初始化完成")
-
-	// 2.4 若未做合并/过滤，把 .repo/manifest.xml 软链到 manifests/<name>（对齐上游 repo）
-	// Windows 创建软链可能因权限failed，failed时回退为已写入的普通文件并告警
-	if !opts.Merged && !opts.Filtered {
-		linkManifestXML(cfg.ManifestName, log)
-	}
 	return nil
 }
 
-// linkManifestXML 在未做合并/过滤时，把 .repo/manifest.xml 替换为指向
-// manifests/<name> 的符号链接（对齐上游 repo 的清单软链行为）。
-// 软链创建failed（如 Windows 无权限）时回退为已写入的普通文件，仅告警不报错。
-func linkManifestXML(manifestName string, log logger.Logger) {
-	if manifestName == "" {
-		manifestName = "default.xml"
+// writeManifestXML 把清单以扁平 XML 写入 .repo/manifest.xml。
+// 写盘前清空 Includes：include 内容已在解析期合并进 Projects，输出扁平清单
+// 可保证再次 Parse 时项目/修订/属性不丢失；若残留 include 标签会重复展开。
+func writeManifestXML(m *manifest.Manifest, log logger.Logger) error {
+	if m == nil {
+		return fmt.Errorf("manifest is nil")
 	}
-	target := filepath.Join("manifests", manifestName)
-	linkPath := filepath.Join(".repo", "manifest.xml")
+	m.Includes = nil
+	// 扁平清单把项目与 remove-project 的相对顺序改成“项目在前、remove 在后”。
+	// 任何残留 remove 都可能在二次解析时重新生效（删除刚写出的项目）或
+	// 因目标不存在而报错，因此写盘前一律清除；解析期已消费的细项无需保留。
+	m.RemoveProjects = nil
 
-	// 确认 manifests/<name> 存在
-	if _, err := os.Stat(filepath.Join(".repo", target)); err != nil {
-		log.Debug("软链目标不存在，保持普通文件 manifest.xml: %s", target)
-		return
+	manifestPath := filepath.Join(".repo", "manifest.xml")
+
+	data, err := m.ToXML()
+	if err != nil {
+		return fmt.Errorf("failed to convert manifest to XML: %w", err)
 	}
 
-	// 移除已写入的普通文件 manifest.xml
-	if err := os.Remove(linkPath); err != nil {
-		log.Debug("移除现有 manifest.xml failed（可能本就是软链）: %v", err)
+	// 使用临时文件 + rename 覆盖目标：rename 会替换软链本身，而不是跟随
+	// 软链写入清单仓库（旧版本可能留下 .repo/manifest.xml -> manifests/<name>
+	// 的软链）。同时保证写入的原子性，避免半写文件。
+	dir := filepath.Dir(manifestPath)
+	tmp, err := os.CreateTemp(dir, ".manifest-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp manifest file: %w", err)
 	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
 
-	// failed to create symlink（相对路径，便于仓库整体迁移）
-	if err := os.Symlink(target, linkPath); err != nil {
-		// Windows 常因缺少权限/开发者模式failed，回退：重新复制原始文件
-		log.Warn("创建 manifest.xml 软链failed（%v），回退为普通文件", err)
-		src, rerr := os.ReadFile(filepath.Join(".repo", target))
-		if rerr == nil {
-			if werr := os.WriteFile(linkPath, src, 0644); werr != nil {
-				log.Debug("回退复制 manifest.xml failed: %v", werr)
-			}
-		}
-		return
+	if _, err := tmp.WriteString(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("failed to write temp manifest file: %w", err)
 	}
-	log.Debug("已将 .repo/manifest.xml 软链到 %s", target)
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("failed to close temp manifest file: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		cleanup()
+		return fmt.Errorf("failed to set manifest file mode: %w", err)
+	}
+	if err := os.Rename(tmpName, manifestPath); err != nil {
+		cleanup()
+		return fmt.Errorf("failed to replace manifest file: %w", err)
+	}
+	log.Debug("已将清单写入 %s", manifestPath)
+	return nil
 }
 
 // initRepoStructure 初始化repo目录结构和配置

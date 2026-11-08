@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -284,5 +285,130 @@ func TestRunSelfUpdate_RejectsInvalidChecksumFlag(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--checksum 参数非法") {
 		t.Errorf("错误信息应指出 --checksum 参数非法，实际: %v", err)
+	}
+}
+
+// TestCheckUpdateRedirect 验证每一跳重定向都重新校验协议：
+// 允许 https→https，拒绝 https→公网 http（含 loopback 的 https 降级）、
+// 非 http(s) 协议与超限跳数。
+func TestCheckUpdateRedirect(t *testing.T) {
+	tests := []struct {
+		name    string
+		origin  string
+		target  string
+		via     int
+		wantErr bool
+	}{
+		{name: "https到https放行", origin: "https://example.com/a", target: "https://cdn.example.com/b"},
+		{name: "https降级到公网http拒绝", origin: "https://example.com/a", target: "http://evil.example.com/b", wantErr: true},
+		{name: "https降级到loopback http拒绝", origin: "https://example.com/a", target: "http://127.0.0.1/b", wantErr: true},
+		{name: "loopback http到loopback http放行", origin: "http://127.0.0.1/a", target: "http://localhost/b"},
+		{name: "目标非http协议拒绝", origin: "https://example.com/a", target: "ftp://example.com/b", wantErr: true},
+		{name: "重定向次数超限拒绝", origin: "https://example.com/a", target: "https://example.com/b", via: maxUpdateRedirects, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			via := make([]*http.Request, 0, tt.via+1)
+			via = append(via, httptest.NewRequest(http.MethodGet, tt.origin, nil))
+			for i := 0; i < tt.via; i++ {
+				via = append(via, httptest.NewRequest(http.MethodGet, tt.origin, nil))
+			}
+
+			err := checkUpdateRedirect(req, via)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("期望拒绝从 %s 重定向到 %s，实际放行", tt.origin, tt.target)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("期望放行从 %s 重定向到 %s，实际得到错误: %v", tt.origin, tt.target, err)
+			}
+		})
+	}
+}
+
+// TestSelfUpdateClientRejectsHTTPDowngradeRedirect 验证真实 HTTP 客户端
+// 在跟随重定向时不会降到明文 HTTP（在任何网络请求发往目标前即失败）。
+func TestSelfUpdateClientRejectsHTTPDowngradeRedirect(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://evil.example.com/repo-linux", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	client := srv.Client()
+	client.CheckRedirect = checkUpdateRedirect
+
+	_, err := client.Get(srv.URL)
+	if err == nil {
+		t.Fatal("期望拒绝 https→http 重定向，实际成功")
+	}
+	if !strings.Contains(err.Error(), "明文 HTTP") && !strings.Contains(err.Error(), "降级") {
+		t.Errorf("错误信息应说明拒绝明文 HTTP 降级，实际: %v", err)
+	}
+}
+
+// TestRunSelfUpdate_RejectsBlankChecksum 验证 --checksum 显式提供但为空白时
+// 报错，不能退化为"未提供校验和"。
+func TestRunSelfUpdate_RejectsBlankChecksum(t *testing.T) {
+	tests := []struct {
+		name        string
+		checksum    string
+		checksumSet bool
+	}{
+		{name: "纯空白", checksum: "   "},
+		{name: "空白含换行", checksum: " \t\n "},
+		{name: "显式空值", checksum: "", checksumSet: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &SelfUpdateOptions{
+				URL:         "https://example.invalid/repo-linux",
+				Checksum:    tt.checksum,
+				checksumSet: tt.checksumSet,
+			}
+			err := runSelfUpdate(opts, VersionInfo{Version: "test"}, logger.NewDefaultLogger())
+			if err == nil {
+				t.Fatal("期望空白 --checksum 报错，实际成功")
+			}
+			if !strings.Contains(err.Error(), "--checksum 参数非法") {
+				t.Errorf("错误信息应指出 --checksum 参数非法，实际: %v", err)
+			}
+		})
+	}
+}
+
+// TestFetchRemoteChecksum_NotFoundSentinel 验证 404/410 以 errChecksumNotFound
+// 区分于其他获取失败：前者允许无校验和继续，后者必须拒绝更新。
+func TestFetchRemoteChecksum_NotFoundSentinel(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		wantAbsent bool
+	}{
+		{name: "404视为不存在", status: http.StatusNotFound, wantAbsent: true},
+		{name: "410视为不存在", status: http.StatusGone, wantAbsent: true},
+		{name: "500视为获取失败", status: http.StatusInternalServerError, wantAbsent: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+			}))
+			defer srv.Close()
+
+			_, err := fetchRemoteChecksum(srv.Client(), srv.URL)
+			if err == nil {
+				t.Fatal("期望报错，实际成功")
+			}
+			gotAbsent := errors.Is(err, errChecksumNotFound)
+			if gotAbsent != tt.wantAbsent {
+				t.Errorf("errors.Is(err, errChecksumNotFound) = %v, 期望 %v (err=%v)", gotAbsent, tt.wantAbsent, err)
+			}
+		})
 	}
 }

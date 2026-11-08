@@ -34,12 +34,18 @@ func (e *ManifestError) Unwrap() error {
 	return e.Err
 }
 
+// manifestCacheEntry 缓存未过滤的完整清单及其依赖指纹。
+// 指纹覆盖主清单、include 文件、.repo/local_manifests/*.xml 的 mtime，
+// 任一依赖变化都会使缓存失效。
+type manifestCacheEntry struct {
+	manifest    *Manifest
+	fingerprint string
+}
+
 // 全局缓存
 var (
-	manifestCache    = make(map[string]*Manifest)
+	manifestCache    = make(map[string]manifestCacheEntry)
 	manifestCacheMux sync.RWMutex
-	fileModTimeCache = make(map[string]time.Time)
-	fileModTimeMux   sync.RWMutex
 )
 
 // Manifest 表示repo的清单文件
@@ -75,11 +81,26 @@ type Manifest struct {
 
 	// 静默模式控制
 	SilentMode bool // 是否启用静默模式，不输出非关键日志
+
+	// elementOrder 记录顶层 project/include/remove-project/extend-project 的
+	// 文档顺序（含各切片下标）；includeSegs 记录 include 引入的项目区间与
+	// 子清单的文档顺序操作日志。Local manifest 以 fragment 模式解析时保留
+	// 原始顺序，mergeLocalManifest 据此按文档顺序将元素应用到主清单。
+	elementOrder []topElem
+	includeSegs  []includeSeg
+	// parsedAsFragment 标记该清单以 local fragment 模式解析（保留原始顺序，
+	// 未应用 remove/extend），mergeLocalManifest 可安全递归重放。
+	parsedAsFragment bool
+	// replayOps 记录本清单按文档顺序执行后的顶层操作（project 已展平，
+	// remove/extend 保留原条目）。父清单在 include 位置逐元素重放该日志，
+	// 从而保留“remove a → 重新定义 a”等文档顺序语义。
+	replayOps []replayOp
 }
 
 // ManifestServer 表示 manifest-server 节点
 type ManifestServer struct { //nolint:revive // 与上游 repo 的 manifest-server 术语一致，重命名会破坏既有调用方
-	URL string `xml:"url,attr"`
+	URL    string `xml:"url,attr"`
+	Helper string `xml:"helper,attr,omitempty"` // 上游 <manifest-server helper="...">：辅助程序路径
 }
 
 // GetCustomAttr 获取自定义属性值
@@ -97,6 +118,7 @@ type Remote struct {
 	Revision    string            `xml:"revision,attr,omitempty"`
 	Alias       string            `xml:"alias,attr,omitempty"`
 	PushURL     string            `xml:"pushurl,attr,omitempty"` // 新增：推送URL
+	Annotations []Annotation      `xml:"annotation"`             // remote 注解（上游 _XmlRemote.annotations）
 	CustomAttrs map[string]string `xml:"-"`                      // 存储自定义属性
 }
 
@@ -144,8 +166,8 @@ type Default struct {
 	DestBranch  string            `xml:"dest-branch,attr,omitempty"` // 默认目标分支
 	Upstream    string            `xml:"upstream,attr,omitempty"`    // 默认上游分支
 	SyncJ       int               `xml:"sync-j,attr,omitempty"`      // 默认并发数
-	SyncC       bool              `xml:"sync-c,attr,omitempty"`      // 默认仅同步当前分支
-	SyncS       bool              `xml:"sync-s,attr,omitempty"`      // 默认同步子模块
+	SyncC       OptBool           `xml:"sync-c,attr,omitempty"`      // 默认仅同步当前分支
+	SyncS       OptBool           `xml:"sync-s,attr,omitempty"`      // 默认同步子模块
 	SyncTags    OptBool           `xml:"sync-tags,attr,omitempty"`   // 默认同步标签（上游缺省 true）
 	Sync        string            `xml:"sync,attr,omitempty"`
 	CustomAttrs map[string]string `xml:"-"` // 存储自定义属
@@ -167,11 +189,11 @@ type Project struct {
 	Upstream    string       `xml:"upstream,attr,omitempty"`    // 上游分支，用于跟踪
 	DestBranch  string       `xml:"dest-branch,attr,omitempty"` // 目标分支，用于上传审查
 	Groups      string       `xml:"groups,attr,omitempty"`
-	SyncC       bool         `xml:"sync-c,attr,omitempty"`
-	SyncS       bool         `xml:"sync-s,attr,omitempty"`
+	SyncC       OptBool      `xml:"sync-c,attr,omitempty"`
+	SyncS       OptBool      `xml:"sync-s,attr,omitempty"`
 	SyncTags    OptBool      `xml:"sync-tags,attr,omitempty"` // 项目级同步标签（上游缺省继承 default）
 	CloneDepth  int          `xml:"clone-depth,attr,omitempty"`
-	ForcePath   bool         `xml:"force-path,attr,omitempty"` // 强制通过 path 而非 name 使用本地镜像
+	ForcePath   OptBool      `xml:"force-path,attr,omitempty"` // 强制通过 path 而非 name 使用本地镜像
 	Copyfiles   []Copyfile   `xml:"copyfile"`
 	Linkfiles   []Linkfile   `xml:"linkfile"`
 	Annotations []Annotation `xml:"annotation"` // 项目注解
@@ -205,7 +227,9 @@ func (p *Project) GetBranch() (string, error) {
 // 支持自定义属性，可以通过CustomAttrs字段访问未在结构体中定义的XML属
 type Include struct {
 	Name        string            `xml:"name,attr"`
-	CustomAttrs map[string]string `xml:"-"` // 存储自定义属
+	Groups      string            `xml:"groups,attr,omitempty"`   // include 级组：并入被包含清单的所有 project/extend-project
+	Revision    string            `xml:"revision,attr,omitempty"` // include 级修订：补到被包含清单中未声明 revision 的 project
+	CustomAttrs map[string]string `xml:"-"`                       // 存储自定义属
 	manifest    *Manifest
 }
 
@@ -236,7 +260,8 @@ func (i *Include) GetCustomAttr(name string) (string, bool) {
 type RemoveProject struct {
 	Name        string            `xml:"name,attr"`
 	Path        string            `xml:"path,attr,omitempty"`     // 新增：路径
-	Optional    bool              `xml:"optional,attr,omitempty"` // 新增：可选标志
+	Optional    OptBool           `xml:"optional,attr,omitempty"` // 新增：可选标志
+	BaseRev     string            `xml:"base-rev,attr,omitempty"` // 命中时要求项目有效 revision 与此一致
 	CustomAttrs map[string]string `xml:"-"`                       // 存储自定义属性
 }
 
@@ -300,15 +325,26 @@ type Annotation struct {
 	Keep  string `xml:"keep,attr,omitempty"` // 新增：保留标志，默认为"true"
 }
 
-// ExtendProject 表示扩展已有项目的配置
+// ExtendProject 表示扩展已有项目的配置。字段语义对齐上游 extend-project：
+//   - path 仅作为匹配条件（不改变项目路径），dest-path 才是新路径；
+//   - groups 与项目现有组取并集；
+//   - base-rev 用于校验 revision 变更基线。
 type ExtendProject struct {
-	Name      string     `xml:"name,attr"`
-	Path      string     `xml:"path,attr,omitempty"`
-	Groups    string     `xml:"groups,attr,omitempty"`
-	Revision  string     `xml:"revision,attr,omitempty"`
-	Remote    string     `xml:"remote,attr,omitempty"`
-	Copyfiles []Copyfile `xml:"copyfile"`
-	Linkfiles []Linkfile `xml:"linkfile"`
+	Name       string     `xml:"name,attr"`
+	Path       string     `xml:"path,attr,omitempty"`
+	DestPath   string     `xml:"dest-path,attr,omitempty"`
+	Groups     string     `xml:"groups,attr,omitempty"`
+	Revision   string     `xml:"revision,attr,omitempty"`
+	BaseRev    string     `xml:"base-rev,attr,omitempty"`
+	Remote     string     `xml:"remote,attr,omitempty"`
+	DestBranch string     `xml:"dest-branch,attr,omitempty"`
+	Upstream   string     `xml:"upstream,attr,omitempty"`
+	Copyfiles  []Copyfile `xml:"copyfile"`
+	Linkfiles  []Linkfile `xml:"linkfile"`
+
+	// fromInclude 标记该条目由 include 段向外传播。此类条目的匹配目标
+	// 可能在外层更后出现，未命中时不按顶层声明 fail-fast，继续向外传播。
+	fromInclude bool
 }
 
 // RepoHooks 表示repo钩子配置
@@ -381,8 +417,8 @@ func (m *Manifest) ToJSON() (string, error) {
 			DestBranch: m.Default.DestBranch,
 			Upstream:   m.Default.Upstream,
 			SyncJ:      m.Default.SyncJ,
-			SyncC:      m.Default.SyncC,
-			SyncS:      m.Default.SyncS,
+			SyncC:      m.Default.SyncC.Get(false),
+			SyncS:      m.Default.SyncS.Get(false),
 			SyncTags:   m.Default.SyncTags.Get(true),
 		},
 	}
@@ -405,8 +441,8 @@ func (m *Manifest) ToJSON() (string, error) {
 			Upstream:   p.Upstream,
 			DestBranch: p.DestBranch,
 			Groups:     p.Groups,
-			SyncC:      p.SyncC,
-			SyncS:      p.SyncS,
+			SyncC:      p.SyncC.Get(false),
+			SyncS:      p.SyncS.Get(false),
 			CloneDepth: p.CloneDepth,
 		}
 		for _, c := range p.Copyfiles {
@@ -425,12 +461,31 @@ func (m *Manifest) ToJSON() (string, error) {
 	return string(data), nil
 }
 
-// GetRemoteURL 根据远程名称获取对应的URL
-func (m *Manifest) GetRemoteURL(remoteName string) (string, error) {
-	for _, remote := range m.Remotes {
-		if remote.Name == remoteName {
-			return remote.Fetch, nil
+// findRemote 返回指定名称或别名的 remote（先精确匹配 Name，再匹配 Alias）。
+// 与上游一致：项目/默认值中的 remote 属性指 Name；Alias 是本地配置名，
+// 但 GetRemote* 系列接口需同时接受两者，避免同一 remote 在不同入口解析结果不一致。
+func (m *Manifest) findRemote(name string) *Remote {
+	if name == "" {
+		return nil
+	}
+	for i := range m.Remotes {
+		if m.Remotes[i].Name == name {
+			return &m.Remotes[i]
 		}
+	}
+	for i := range m.Remotes {
+		if m.Remotes[i].Alias != "" && m.Remotes[i].Alias == name {
+			return &m.Remotes[i]
+		}
+	}
+	return nil
+}
+
+// GetRemoteURL 根据远程名称获取对应的URL。匹配时同时考虑 Alias（远程别名），
+// 与 GetRemoteReview/GetRemotePushURL 保持一致。
+func (m *Manifest) GetRemoteURL(remoteName string) (string, error) {
+	if remote := m.findRemote(remoteName); remote != nil {
+		return remote.Fetch, nil
 	}
 	return "", fmt.Errorf("remote %s not found", remoteName)
 }
@@ -438,10 +493,8 @@ func (m *Manifest) GetRemoteURL(remoteName string) (string, error) {
 // GetRemoteReview 返回指定 remote 的 Gerrit review URL（<remote review="...">）。
 // 匹配时同时考虑 Alias（远程别名）。未找到或未配置时返回 ("", nil)。
 func (m *Manifest) GetRemoteReview(remoteName string) (string, error) {
-	for _, remote := range m.Remotes {
-		if remote.Name == remoteName || (remote.Alias != "" && remote.Alias == remoteName) {
-			return remote.Review, nil
-		}
+	if remote := m.findRemote(remoteName); remote != nil {
+		return remote.Review, nil
 	}
 	return "", fmt.Errorf("remote %s not found", remoteName)
 }
@@ -450,13 +503,11 @@ func (m *Manifest) GetRemoteReview(remoteName string) (string, error) {
 // 匹配时同时考虑 Alias（远程别名）。未找到 remote 时返回 ("", error)。
 // 用于 repo download 通过 SSH 查询 Gerrit 时取 host（对齐上游：取 push 地址的 host + 29418 端口）。
 func (m *Manifest) GetRemotePushURL(remoteName string) (string, error) {
-	for _, remote := range m.Remotes {
-		if remote.Name == remoteName || (remote.Alias != "" && remote.Alias == remoteName) {
-			if remote.PushURL != "" {
-				return remote.PushURL, nil
-			}
-			return remote.Fetch, nil
+	if remote := m.findRemote(remoteName); remote != nil {
+		if remote.PushURL != "" {
+			return remote.PushURL, nil
 		}
+		return remote.Fetch, nil
 	}
 	return "", fmt.Errorf("remote %s not found", remoteName)
 }
@@ -574,16 +625,31 @@ func getGlobalSilentMode() bool {
 type Parser struct {
 	silentMode   bool
 	cacheEnabled bool
-	visitedFiles map[string]bool // 用于检测循环引用
-	includeDepth int             // 当前解析位于 include 链内的深度（>0 表示是被 include 的子清单）
+	// useLocalManifests 控制是否在最外层解析时合并 .repo/local_manifests。
+	// 默认 true；-m/--manifest-name、diff-manifests 等需要“纯净上游清单”的
+	// 场景应显式关闭，避免把当前检出的本地覆盖混入结果。
+	useLocalManifests bool
+	// localFragment 表示当前 Parse 正在解析 local manifest 片段：跳过
+	// remove/extend 的应用与去重，保留原始切片下标供 mergeLocalManifest
+	// 按文档顺序重放。
+	localFragment bool
+	// includeGroups/includeRevision 是 include 链向下继承的组与修订：
+	// include 声明的 groups 并集作用于被包含清单的 project/extend-project，
+	// revision 补到未声明 revision 的 project（对齐上游 _ParseManifestXml）。
+	includeGroups   []string
+	includeRevision string
+	visitedFiles    map[string]bool // 用于检测循环引用
+	includeDepth    int             // 当前解析位于 include 链内的深度（>0 表示是被 include 的子清单）
+	parseDepth      int             // Parse 递归深度：1 表示最外层（只有最外层处理 local_manifests）
 }
 
 // NewParser creates a manifest parser
 func NewParser() *Parser {
 	return &Parser{
-		silentMode:   getGlobalSilentMode(),
-		cacheEnabled: true,
-		visitedFiles: make(map[string]bool),
+		silentMode:        getGlobalSilentMode(),
+		cacheEnabled:      true,
+		useLocalManifests: true,
+		visitedFiles:      make(map[string]bool),
 	}
 }
 
@@ -595,6 +661,13 @@ func (p *Parser) SetSilentMode(silent bool) {
 // SetCacheEnabled 设置是否启用缓存
 func (p *Parser) SetCacheEnabled(enabled bool) {
 	p.cacheEnabled = enabled
+}
+
+// SetUseLocalManifests 设置是否在最外层解析时合并 .repo/local_manifests。
+// 默认启用；显式传入 false 可解析“纯净”的上游清单（例如 -m 指定清单
+// 或 diff-manifests 场景）。该模式参与缓存 key，两种模式互不污染。
+func (p *Parser) SetUseLocalManifests(enabled bool) {
+	p.useLocalManifests = enabled
 }
 
 // ParseFromFile 从文件解析清单
@@ -615,37 +688,35 @@ func (p *Parser) ParseFromFile(filename string, groups []string) (*Manifest, err
 		successPath = absPath
 	}
 
-	// 检查缓存
-	if p.cacheEnabled {
-		manifestCacheMux.RLock()
-		fileModTimeMux.RLock()
-		cachedManifest, hasCachedManifest := manifestCache[successPath]
-		cachedModTime, hasCachedModTime := fileModTimeCache[successPath]
-		fileModTimeMux.RUnlock()
-		manifestCacheMux.RUnlock()
-
-		if hasCachedManifest && hasCachedModTime {
-			// 检查文件是否被修改
-			fileInfo, err := os.Stat(successPath)
-			if err == nil && !fileInfo.ModTime().After(cachedModTime) {
-				// 文件未被修改，使用缓存
-				// 深拷贝以避免调用方修改缓存中的切片（Projects/Remotes/Includes 共享底层数组）
-				manifestCopy := deepCopyManifest(cachedManifest)
-
-				// 应用组过
-				if len(groups) > 0 && !MatchesAllGroups(groups) {
-					return p.filterProjectsByGroups(manifestCopy, groups)
-				}
-
-				return manifestCopy, nil
-			}
-		}
-	}
-
-	// 读取文件
+	// 读取文件（指纹计算与变量检测都需要原始内容）
 	data, err := os.ReadFile(successPath)
 	if err != nil {
 		return nil, &ManifestError{Op: "read", Path: successPath, Err: err}
+	}
+
+	// 变量/模板参与替换时清单内容依赖进程环境，直接禁用缓存，避免
+	// 同一路径在环境变化后返回陈旧结果。
+	cacheable := p.cacheEnabled && !manifestTreeHasVariables(successPath, data, p.useLocalManifests)
+	fingerprint := ""
+	cacheKey := ""
+	if cacheable {
+		fingerprint = manifestDependencyFingerprint(successPath, p.useLocalManifests)
+		cacheKey = manifestCacheKey(successPath, p.useLocalManifests, p.includeDepth, p.localFragment)
+	}
+
+	// 检查缓存
+	if cacheable {
+		manifestCacheMux.RLock()
+		cached, ok := manifestCache[cacheKey]
+		manifestCacheMux.RUnlock()
+		if ok && cached.fingerprint == fingerprint && cached.manifest != nil {
+			// 深拷贝以避免调用方修改缓存中的切片（Projects/Remotes/Includes 共享底层数组）
+			manifestCopy := deepCopyManifest(cached.manifest)
+			if len(groups) > 0 && !MatchesAllGroups(groups) {
+				return p.filterProjectsByGroups(manifestCopy, groups)
+			}
+			return manifestCopy, nil
+		}
 	}
 
 	// 解析数据：始终以 nil groups 解析出完整清单，缓存只保存未过滤版本；
@@ -657,19 +728,13 @@ func (p *Parser) ParseFromFile(filename string, groups []string) (*Manifest, err
 	}
 
 	// 更新缓存（缓存未过滤的完整清单的深拷贝）
-	if p.cacheEnabled {
-		fileInfo, err := os.Stat(successPath)
-		if err == nil {
-			// 深拷贝以避免缓存与返回值共享切片底层数组
-			manifestCopy := deepCopyManifest(manifest)
-
-			manifestCacheMux.Lock()
-			fileModTimeMux.Lock()
-			manifestCache[successPath] = manifestCopy
-			fileModTimeCache[successPath] = fileInfo.ModTime()
-			fileModTimeMux.Unlock()
-			manifestCacheMux.Unlock()
+	if cacheable && manifestFingerprintUnchanged(successPath, fingerprint, p.useLocalManifests) {
+		manifestCacheMux.Lock()
+		manifestCache[cacheKey] = manifestCacheEntry{
+			manifest:    deepCopyManifest(manifest),
+			fingerprint: fingerprint,
 		}
+		manifestCacheMux.Unlock()
 	}
 
 	// 应用组过滤（在返回给调用方的对象上原地过滤，不影响缓存副本）
@@ -788,6 +853,251 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// manifestVarRefRegex 匹配会被 replaceVariables/expandMacros 替换的变量与模板语法。
+var manifestVarRefRegex = regexp.MustCompile(`\$\{|\$[A-Za-z_]|\{\{`)
+
+// hasManifestVariables 判断清单内容是否包含变量/模板引用。此类清单的解析
+// 结果依赖进程环境，缓存不可靠，直接禁用。
+func hasManifestVariables(data []byte) bool {
+	return manifestVarRefRegex.Match(data)
+}
+
+// manifestIncludeNames 扫描 XML 中所有 <include name="..."> 的 name（不关心
+// 嵌套层级：include 可能出现在任意 depth，processIncludes 会递归展开）。
+func manifestIncludeNames(data []byte) []string {
+	names := make([]string, 0)
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok || start.Name.Local != "include" {
+			continue
+		}
+		for _, a := range start.Attr {
+			if a.Name.Local == "name" && a.Value != "" {
+				names = append(names, a.Value)
+				break
+			}
+		}
+	}
+	return names
+}
+
+// manifestIncludeRoots 返回 include 名称的解析根目录（与 processIncludes 的
+// 查找顺序保持一致）：.repo/manifests、cwd、topDir。
+func manifestIncludeRoots(mainPath string) []string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	topDir := findTopLevelRepoDir(cwd)
+	if topDir == "" {
+		topDir = cwd
+	}
+	roots := []string{}
+	for _, dir := range []string{
+		filepath.Join(topDir, ".repo", "manifests"),
+		cwd,
+		topDir,
+		filepath.Dir(mainPath),
+	} {
+		roots = append(roots, dir)
+	}
+	return roots
+}
+
+// manifestDependencyFiles 递归收集清单依赖：主清单自身、include 链（可位于
+// 子目录）解析到的文件，以及启用 local manifests 时的 .repo/local_manifests
+// 下所有 *.xml 及其 include 依赖。返回收集到的文件（去重）与 include 名称
+// 的所有候选路径（含尚未存在的文件，用于感知“文件后来被创建”）。
+func manifestDependencyFiles(mainPath string, useLocal bool) (files []string, candidates []string) {
+	roots := manifestIncludeRoots(mainPath)
+	seen := make(map[string]bool)
+	candSeen := make(map[string]bool)
+
+	var walk func(p string)
+	walk = func(p string) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		if seen[abs] {
+			return
+		}
+		seen[abs] = true
+		files = append(files, abs)
+
+		data, readErr := os.ReadFile(abs)
+		if readErr != nil {
+			return
+		}
+		for _, name := range manifestIncludeNames(data) {
+			resolved := ""
+			for _, root := range roots {
+				candidate := filepath.Clean(filepath.Join(root, name))
+				if !candSeen[candidate] {
+					candSeen[candidate] = true
+					candidates = append(candidates, candidate)
+				}
+				if resolved == "" && fileExists(candidate) {
+					resolved = candidate
+				}
+			}
+			if resolved != "" {
+				walk(resolved)
+			}
+		}
+	}
+
+	walk(mainPath)
+
+	if useLocal {
+		topDir := findTopLevelRepoDirOrCwd()
+		localDir := filepath.Join(topDir, ".repo", "local_manifests")
+		entries, err := os.ReadDir(localDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".xml") {
+					continue
+				}
+				walk(filepath.Join(localDir, entry.Name()))
+			}
+		}
+	}
+
+	return files, candidates
+}
+
+// findTopLevelRepoDirOrCwd 返回包含 .repo 的顶层目录；找不到时退回 cwd。
+func findTopLevelRepoDirOrCwd() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	if topDir := findTopLevelRepoDir(cwd); topDir != "" {
+		return topDir
+	}
+	return cwd
+}
+
+// manifestTreeHasVariables 检查主清单及其递归 include/local manifest 依赖是否
+// 包含变量引用：任一依赖依赖环境时禁用整个文件的缓存。
+func manifestTreeHasVariables(mainPath string, data []byte, useLocal bool) bool {
+	if hasManifestVariables(data) {
+		return true
+	}
+	files, _ := manifestDependencyFiles(mainPath, useLocal)
+	mainAbs, err := filepath.Abs(mainPath)
+	if err != nil {
+		mainAbs = mainPath
+	}
+	for _, file := range files {
+		if file == mainAbs {
+			continue
+		}
+		content, readErr := os.ReadFile(file)
+		if readErr != nil {
+			continue
+		}
+		if hasManifestVariables(content) {
+			return true
+		}
+	}
+	return false
+}
+
+// manifestCacheKey 生成缓存 key：同一路径在“合并 local manifests”与“纯净
+// 上游清单”两种模式下结果不同，必须分开缓存。解析上下文同样影响结果：
+// include 链内解析不强制 revision（requireRevision=false），local fragment
+// 模式保留原始文档顺序而不应用 remove/extend，因此一并纳入 key，避免不同
+// 模式互相命中陈旧结果。
+func manifestCacheKey(mainPath string, useLocal bool, includeDepth int, localFragment bool) string {
+	return fmt.Sprintf("%s|useLocalManifests=%t|includeDepth=%d|requireRevision=%t|localFragment=%t",
+		mainPath, useLocal, includeDepth, includeDepth == 0, localFragment)
+}
+
+// manifestDependencyFingerprint 计算清单及其依赖文件的指纹：主清单、递归
+// include 文件（可位于子目录）与 local manifests 的 mtime/size，标准目录的
+// 有序文件列表，以及 include 候选路径（新增文件同样触发失效）。
+func manifestDependencyFingerprint(mainPath string, useLocal bool) string {
+	seen := make(map[string]bool)
+	entries := make([]string, 0)
+	addFile := func(p string) {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		if seen[abs] {
+			return
+		}
+		seen[abs] = true
+		st, statErr := os.Stat(abs)
+		if statErr != nil {
+			entries = append(entries, abs+":missing")
+			return
+		}
+		entries = append(entries, fmt.Sprintf("%s:%d:%d", abs, st.ModTime().UnixNano(), st.Size()))
+	}
+
+	files, candidates := manifestDependencyFiles(mainPath, useLocal)
+	for _, f := range files {
+		addFile(f)
+	}
+	// 未解析到的 include 候选路径也纳入指纹：文件从无到有时 stat 结果变化
+	for _, candidate := range candidates {
+		addFile(candidate)
+	}
+
+	topDir := findTopLevelRepoDirOrCwd()
+	dirs := []string{
+		filepath.Dir(mainPath),
+		filepath.Join(topDir, ".repo", "manifests"),
+	}
+	if useLocal {
+		dirs = append(dirs, filepath.Join(topDir, ".repo", "local_manifests"))
+	}
+	// include 子目录的文件集合也需纳入：递归收集每个候选路径的父目录
+	dirSeen := make(map[string]bool)
+	for _, candidate := range candidates {
+		dir := filepath.Dir(candidate)
+		if candidate == mainPath || dirSeen[dir] {
+			continue
+		}
+		dirSeen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	for _, dir := range dirs {
+		dirEntries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		names := make([]string, 0, len(dirEntries))
+		for _, entry := range dirEntries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".xml") {
+				names = append(names, entry.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			addFile(filepath.Join(dir, name))
+		}
+		// 目录文件列表本身也纳入指纹：新增/删除 *.xml 必须使缓存失效
+		entries = append(entries, "dir:"+dir+":"+strings.Join(names, ","))
+	}
+
+	sort.Strings(entries)
+	return strings.Join(entries, "\n")
+}
+
+// manifestFingerprintUnchanged 在解析完成后重新计算指纹，确认解析期间依赖未变化，
+// 避免把基于旧依赖解析的结果写入缓存。
+func manifestFingerprintUnchanged(mainPath, fingerprint string, useLocal bool) bool {
+	return manifestDependencyFingerprint(mainPath, useLocal) == fingerprint
+}
+
 // deepCopyManifest 创建 manifest 的深拷贝，确保 Projects/Remotes/Includes 等切片
 // 不与原对象共享底层数组。用于缓存读写，防止调用方修改切片元素时污染缓存。
 func deepCopyManifest(src *Manifest) *Manifest {
@@ -802,15 +1112,14 @@ func deepCopyManifest(src *Manifest) *Manifest {
 		copy(dst.Remotes, src.Remotes)
 		for i := range dst.Remotes {
 			dst.Remotes[i].CustomAttrs = copyAttrsMap(src.Remotes[i].CustomAttrs)
+			dst.Remotes[i].Annotations = copyAnnotations(src.Remotes[i].Annotations)
 		}
 	}
 	if len(src.Projects) > 0 {
 		dst.Projects = make([]Project, len(src.Projects))
 		copy(dst.Projects, src.Projects)
 		for i := range dst.Projects {
-			dst.Projects[i].CustomAttrs = copyAttrsMap(src.Projects[i].CustomAttrs)
-			dst.Projects[i].Copyfiles = copyCopyfiles(src.Projects[i].Copyfiles)
-			dst.Projects[i].Linkfiles = copyLinkfiles(src.Projects[i].Linkfiles)
+			dst.Projects[i] = copyProject(src.Projects[i])
 		}
 	}
 	if len(src.Includes) > 0 {
@@ -838,7 +1147,62 @@ func deepCopyManifest(src *Manifest) *Manifest {
 			dst.ExtendProjects[i].Linkfiles = copyLinkfiles(src.ExtendProjects[i].Linkfiles)
 		}
 	}
+	if len(src.replayOps) > 0 {
+		dst.replayOps = make([]replayOp, len(src.replayOps))
+		for i := range src.replayOps {
+			dst.replayOps[i] = src.replayOps[i]
+			if len(src.replayOps[i].projects) > 0 {
+				projects := make([]Project, len(src.replayOps[i].projects))
+				for j := range src.replayOps[i].projects {
+					projects[j] = copyProject(src.replayOps[i].projects[j])
+				}
+				dst.replayOps[i].projects = projects
+			}
+			dst.replayOps[i].remove.CustomAttrs = copyAttrsMap(src.replayOps[i].remove.CustomAttrs)
+			dst.replayOps[i].extend.Copyfiles = copyCopyfiles(src.replayOps[i].extend.Copyfiles)
+			dst.replayOps[i].extend.Linkfiles = copyLinkfiles(src.replayOps[i].extend.Linkfiles)
+		}
+	}
+	// 指针型节点按值复制，避免缓存与调用方共享同一对象
+	if src.RepoHooks != nil {
+		hooks := *src.RepoHooks
+		dst.RepoHooks = &hooks
+	}
+	if src.ManifestServer != nil {
+		server := *src.ManifestServer
+		dst.ManifestServer = &server
+	}
+	if src.Superproject != nil {
+		superproject := *src.Superproject
+		dst.Superproject = &superproject
+	}
 	return &dst
+}
+
+// copyProject 深拷贝项目（含嵌套子项目/注解/copyfile/linkfile），用于缓存隔离。
+func copyProject(src Project) Project {
+	dst := src
+	dst.CustomAttrs = copyAttrsMap(src.CustomAttrs)
+	dst.Copyfiles = copyCopyfiles(src.Copyfiles)
+	dst.Linkfiles = copyLinkfiles(src.Linkfiles)
+	dst.Annotations = copyAnnotations(src.Annotations)
+	if len(src.Projects) > 0 {
+		dst.Projects = make([]Project, len(src.Projects))
+		for i := range src.Projects {
+			dst.Projects[i] = copyProject(src.Projects[i])
+		}
+	}
+	return dst
+}
+
+// copyAnnotations 深拷贝注解切片。
+func copyAnnotations(src []Annotation) []Annotation {
+	if len(src) == 0 {
+		return src
+	}
+	out := make([]Annotation, len(src))
+	copy(out, src)
+	return out
 }
 
 // copyAttrsMap 深拷贝自定义属性 map；nil 保持 nil 以维持零值语义
@@ -879,6 +1243,28 @@ func copyLinkfiles(src []Linkfile) []Linkfile {
 	return out
 }
 
+// validateUniqueProjectPaths 校验项目有效 path（Path 缺省取 Name）唯一性。
+// 展平后的嵌套子项目同样参与校验；重复 path（包括 name+path 完全相同）
+// 都是清单错误，不能静默去重，否则后续按 path 定位项目会指向错误目标。
+func validateUniqueProjectPaths(m *Manifest) error {
+	seen := make(map[string]string, len(m.Projects))
+	for _, proj := range m.Projects {
+		projectPath := normalizeManifestPath(proj.Path)
+		if projectPath == "" {
+			projectPath = normalizeManifestPath(proj.Name)
+		}
+		if prev, ok := seen[projectPath]; ok {
+			return &ManifestError{
+				Op: "parse",
+				Err: fmt.Errorf("duplicate path %q: projects %q and %q",
+					projectPath, prev, proj.Name),
+			}
+		}
+		seen[projectPath] = proj.Name
+	}
+	return nil
+}
+
 // filterProjectsByGroups 根据组过滤项
 func (p *Parser) filterProjectsByGroups(manifest *Manifest, groups []string) (*Manifest, error) {
 	if len(groups) == 0 || MatchesAllGroups(groups) {
@@ -908,6 +1294,12 @@ func (p *Parser) ParseFromBytes(data []byte, groups []string) (*Manifest, error)
 
 // Parse 解析清单数据
 func (p *Parser) Parse(data []byte, groups []string) (*Manifest, error) {
+	// parseDepth 用于保证 local_manifests 只在最外层 Parse 处理一次：
+	// include/local manifest 的递归 Parse 不得再次扫描 local_manifests，
+	// 否则会无限递归。
+	p.parseDepth++
+	defer func() { p.parseDepth-- }()
+
 	// 首先进行变量替换 (保留原有的 $VAR 兼容)
 	envVars := p.getEnvVars()
 	processedData := p.replaceVariables(data, envVars)
@@ -931,13 +1323,7 @@ func (p *Parser) Parse(data []byte, groups []string) (*Manifest, error) {
 		manifest.Remotes[i].CustomAttrs = make(map[string]string)
 	}
 	for i := range manifest.Projects {
-		manifest.Projects[i].CustomAttrs = make(map[string]string)
-		for j := range manifest.Projects[i].Copyfiles {
-			manifest.Projects[i].Copyfiles[j].CustomAttrs = make(map[string]string)
-		}
-		for j := range manifest.Projects[i].Linkfiles {
-			manifest.Projects[i].Linkfiles[j].CustomAttrs = make(map[string]string)
-		}
+		initProjectMaps(&manifest.Projects[i])
 	}
 	for i := range manifest.Includes {
 		manifest.Includes[i].CustomAttrs = make(map[string]string)
@@ -969,77 +1355,91 @@ func (p *Parser) Parse(data []byte, groups []string) (*Manifest, error) {
 		manifest.PartialCloneExclude = partialCloneExclude
 	}
 
-	// 当 default remote 为空且只有一个 remote 时，将该 remote 作为默认值
+	// default remote 缺省：仅一个 remote 时取之（上游 _get_remote）。
 	if manifest.Default.Remote == "" && len(manifest.Remotes) == 1 {
-		defaultRemote := manifest.Remotes[0]
-		manifest.Default.Remote = defaultRemote.Name
-
-		// 如果该 remote 有定义 revision，则将其作为默认的 revision
-		if manifest.Default.Revision == "" && defaultRemote.Revision != "" {
-			manifest.Default.Revision = defaultRemote.Revision
-		}
+		manifest.Default.Remote = manifest.Remotes[0].Name
 	}
+	// 注意：上游不会把“第一个声明 revision 的 remote”灌入 Default.Revision。
+	// revision 解析按项目进行：project.revision → 该项目 remote.revision →
+	// default.revision（见 applyProjectDefaults）。
+
+	// 项目 name/path 合法性校验（上游 _CheckLocalPath 等价）：必须在任何
+	// remove/extend/展平之前执行，避免 ../ 路径逃逸或非法组件进入后续逻辑。
+	if err := validateProjectTree(manifest.Projects); err != nil {
+		return nil, err
+	}
+
+	// include 链继承：include 的 groups 并集作用于被包含清单的
+	// project/extend-project；include 的 revision 补到未声明 revision 的项目
+	// 与嵌套 include（对齐上游 _ParseManifestXml 的 node.setAttribute 语义）。
+	p.applyIncludeInheritance(&manifest)
 
 	// 扫描主清单顶层元素顺序（remove-project 依赖文档顺序执行）
 	seq := scanTopLevelElements(processedData)
+	manifest.elementOrder = seq
+	manifest.parsedAsFragment = p.localFragment
 
-	// 处理包含的清单文件（include 项目追加，notice 合并，悬空 remove 传播）
-	includeSegs, err := p.processIncludes(&manifest, groups)
+	// 处理包含的清单文件（include 项目追加，notice 合并，悬空 remove/extend 传播）。
+	// 子清单以 nil groups 解析：先按 -g 过滤会让 include 内的 remove/extend
+	// 看不到被排除的项目而误判，最终统一在最外层过滤。
+	includeSegs, err := p.processIncludes(&manifest, nil)
 	if err != nil {
 		return nil, &ManifestError{Op: "process_includes", Err: err}
 	}
+	manifest.includeSegs = includeSegs
 
-	// 按文档顺序执行 remove-project，并展平嵌套子项目（上游用嵌套
-	// <project> 表达 Git submodule）
-	if err := p.applyRemoveProjects(&manifest, seq, includeSegs); err != nil {
-		return nil, &ManifestError{Op: "apply_remove_projects", Err: err}
+	if p.localFragment {
+		// local manifest 片段：保留原始顺序与切片下标。remove/extend 不在
+		// 此应用，由 mergeLocalManifest 按文档顺序重放到主清单；也不做去重，
+		// 否则下标映射会与 elementOrder 失配。
+		if err := applyProjectDefaults(&manifest, false); err != nil {
+			return nil, err
+		}
+		return &manifest, nil
 	}
 
-	// 应用ExtendProject配置
-	if err := p.applyExtendProjects(&manifest); err != nil {
-		return nil, &ManifestError{Op: "apply_extend_projects", Err: err}
+	// include 链内的清单在重放前先补全自身 default：操作日志中的项目条目
+	// 会携带这些缺省值，父层重放后仍保留子清单自己的 remote/revision
+	// （dest-path 等 extend 改变有效 path 时，重放日志无法事后按 path 回填）。
+	if p.includeDepth > 0 {
+		if err := applyProjectDefaults(&manifest, false); err != nil {
+			return nil, err
+		}
 	}
 
-	// 处理local_manifests（如果存在）
-	if err := p.processLocalManifests(&manifest, groups); err != nil {
-		// local_manifests是可选的，处理失败只记录警告并继续
-		if !p.silentMode {
-			fmt.Fprintf(os.Stderr, "警告: 处理local manifests失败 (%v)，已忽略\n", err)
+	// 按文档顺序重放 project/include/remove-project/extend-project，并展平
+	// 嵌套子项目（上游用嵌套 <project> 表达 Git submodule）。操作日志供
+	// 父层 include 位置逐元素重放，保留文档顺序语义。
+	replayOps, err := p.replayDocumentOrder(&manifest, seq, includeSegs)
+	if err != nil {
+		return nil, &ManifestError{Op: "replay_manifest", Err: err}
+	}
+	manifest.replayOps = replayOps
+
+	// 处理local_manifests（如果存在）。只允许最外层、非 include 链内的 Parse
+	// 处理一次：include / local manifest 的递归 Parse 不得重复扫描。开关关闭
+	// 时（-m/diff-manifests 场景）完全跳过，避免混入当前检出的本地覆盖。
+	if p.useLocalManifests && p.parseDepth == 1 && p.includeDepth == 0 {
+		if err := p.processLocalManifests(&manifest, nil); err != nil {
+			// 上游对 local manifest 解析错误是致命的（不会静默跳过），
+			// 即使 silent 模式也必须返回错误。
+			return nil, &ManifestError{Op: "process_local_manifests", Err: err}
 		}
 	}
 
 	// 对全部项目（含 include/local_manifests 引入的）统一补全缺省值。
 	// 对齐上游 _ParseProject 的继承链：path/remote/revision/dest-branch/
-	// upstream 缺省时回退到 default 元素。旧实现只补全主清单自身项目，
-	// include 引入且未自带 default 的项目 remote/revision 均为空。
-	applyProjectDefaults(&manifest)
-
-	// 对项目列表进行去重处理（使用 name + path 组合作为唯一标识）
-	deduplicatedProjects := make([]Project, 0)
-	projectKeyMap := make(map[string]bool) // 用于跟踪 name+path 组合
-
-	for _, proj := range manifest.Projects {
-		// 使用 name + path 组合作为唯一标识
-		path := proj.Path
-		if path == "" {
-			path = proj.Name // 如果path为空，使用name作为path
-		}
-		key := proj.Name + "@@" + path // 使用特殊分隔符避免冲突
-
-		// 如果 name+path 组合已存在，则跳过
-		if projectKeyMap[key] {
-			continue
-		}
-
-		// 标记 name+path 组合为已处理
-		projectKeyMap[key] = true
-
-		// 添加到去重后的列表
-		deduplicatedProjects = append(deduplicatedProjects, proj)
+	// upstream 缺省时回退到 default 元素；revision 链全部为空时报错。
+	// 只有最外层 Parse 强制 revision（include/local 片段可能依赖外层 default）。
+	if err := applyProjectDefaults(&manifest, p.includeDepth == 0); err != nil {
+		return nil, err
 	}
 
-	// 更新项目列表
-	manifest.Projects = deduplicatedProjects
+	// 按有效 path（缺省取 name，含展平后的子项目）校验唯一性：重复 path
+	// 视为清单错误（上游同样以 duplicate path 失败），不得静默去重。
+	if err := validateUniqueProjectPaths(&manifest); err != nil {
+		return nil, err
+	}
 
 	// 根据groups过滤项目
 	if len(groups) > 0 && !MatchesAllGroups(groups) {
@@ -1049,31 +1449,99 @@ func (p *Parser) Parse(data []byte, groups []string) (*Manifest, error) {
 	return &manifest, nil
 }
 
+// initProjectMaps 递归初始化项目及其嵌套子项目的 CustomAttrs/copyfile/linkfile
+// CustomAttrs，保证后续属性填充不会写 nil map。
+func initProjectMaps(p *Project) {
+	if p.CustomAttrs == nil {
+		p.CustomAttrs = make(map[string]string)
+	}
+	for j := range p.Copyfiles {
+		if p.Copyfiles[j].CustomAttrs == nil {
+			p.Copyfiles[j].CustomAttrs = make(map[string]string)
+		}
+	}
+	for j := range p.Linkfiles {
+		if p.Linkfiles[j].CustomAttrs == nil {
+			p.Linkfiles[j].CustomAttrs = make(map[string]string)
+		}
+	}
+	for j := range p.Projects {
+		initProjectMaps(&p.Projects[j])
+	}
+}
+
 // applyProjectDefaults 对全部项目统一补全 default 元素规定的缺省值，并构建
 // 远程 URL 缓存属性。对齐上游 _ParseProject：
 //   - path 缺省取 name；
-//   - remote/revision/dest-branch/upstream 缺省继承 default 元素。
-func applyProjectDefaults(m *Manifest) {
+//   - remote/dest-branch/upstream 缺省继承 default 元素；
+//   - revision 按 priority 解析：project.revision → 该项目 remote.revision →
+//     default.revision；requireRevision 为 true 时三者皆空报错
+//     “no revision for project”（include/local 片段可延后由外层补全）。
+func applyProjectDefaults(m *Manifest, requireRevision bool) error {
 	for i := range m.Projects {
 		proj := &m.Projects[i]
+
+		// path/name 归一化：尾部 "/" 不参与语义（foo 与 foo/ 视为同一 path）。
+		// 必须在 path 缺省、去重与 URL 构建之前完成。
+		proj.Name = normalizeManifestPath(proj.Name)
+		proj.Path = normalizeManifestPath(proj.Path)
 
 		// 如果项目没有指定路径，则使用项目名称作为默认路径
 		if proj.Path == "" {
 			proj.Path = proj.Name
 		}
+		// 路径合法性校验（Parse 已对显式 name/path 校验；这里覆盖缺省 path
+		// 以及 local 合并/extend-project 产生的有效路径，阻断 ../ 逃逸）。
+		if msg := checkLocalPath(proj.Path, true, true); msg != "" {
+			return &ManifestError{
+				Op:  "parse",
+				Err: fmt.Errorf("project %q invalid path %q: %s", proj.Name, proj.Path, msg),
+			}
+		}
 		// 如果项目没有指定远程仓库，则使用默认远程仓库
 		if proj.Remote == "" {
 			proj.Remote = m.Default.Remote
 		}
-		// 如果项目没有指定修订版本，则使用默认修订版本
+
+		// 验证远程仓库是否存在（Name 优先，其次 Alias，与 GetRemote* 一致）。
+		remoteObj := m.findRemote(proj.Remote)
+		if remoteObj == nil && requireRevision && proj.Remote != "" {
+			// 显式指定（或经 default 继承）了非空 remote 却找不到定义：
+			// 顶层解析必须报错，避免静默落成空 FetchBase 或错误相对 URL。
+			// include/local 片段此时可能引用外层 remote，延后到外层统一校验。
+			return &ManifestError{
+				Op:  "parse",
+				Err: fmt.Errorf("remote %s not defined", proj.Remote),
+			}
+		}
+
+		// revision 继承链（上游 _ParseProject）：
+		// project.revision → remote.revision → default.revision。
+		if proj.Revision == "" && remoteObj != nil {
+			proj.Revision = remoteObj.Revision
+		}
 		if proj.Revision == "" {
 			proj.Revision = m.Default.Revision
 		}
+		if proj.Revision == "" && requireRevision {
+			return &ManifestError{
+				Op:  "parse",
+				Err: fmt.Errorf("no revision for project %s", proj.Name),
+			}
+		}
+
 		// sync-tags 缺省继承 default（上游 _ParseProject：XmlBool(node,
 		// "sync-tags", self._default.sync_tags)）；default 亦未声明时由消费方
 		// 按上游缺省 true 处理
 		if !proj.SyncTags.Set {
 			proj.SyncTags = m.Default.SyncTags
+		}
+		// sync-c/sync-s 缺省继承 default（上游 _ParseProject 的 XmlBool 默认值）
+		if !proj.SyncC.Set {
+			proj.SyncC = m.Default.SyncC
+		}
+		if !proj.SyncS.Set {
+			proj.SyncS = m.Default.SyncS
 		}
 		// dest-branch/upstream 缺省继承 default 元素（上游 _ParseProject）
 		if proj.DestBranch == "" {
@@ -1086,16 +1554,8 @@ func applyProjectDefaults(m *Manifest) {
 			proj.CustomAttrs = make(map[string]string)
 		}
 
-		// 验证远程仓库是否存在
-		var remoteObj *Remote
-		for j := range m.Remotes {
-			if m.Remotes[j].Name == proj.Remote {
-				remoteObj = &m.Remotes[j]
-				break
-			}
-		}
 		if remoteObj == nil {
-			// 如果找不到远程仓库，不中断处理
+			// 空 remote 且无 default：保留旧行为（不中断），由上层使用方决定。
 			continue
 		}
 		// 记录远程仓库的Fetch属性，用于后续构建完整URL
@@ -1111,169 +1571,254 @@ func applyProjectDefaults(m *Manifest) {
 		// 存储完整的远程URL
 		proj.CustomAttrs["__remote_url"] = remoteURL
 	}
+	return nil
 }
 
-// parseCustomAttributes 解析XML中的自定义属
-func parseCustomAttributes(data []byte, manifest *Manifest) error {
-	// 创建一个临时结构来解析XML
-	type xmlNode struct {
-		XMLName xml.Name   `xml:""`
-		Attrs   []xml.Attr `xml:",any,attr"`
-		Nodes   []xmlNode  `xml:",any"`
-	}
-
-	// 解析XML到临时结
-	var root xmlNode
-	if err := xml.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("解析XMLfailed: %w", err)
-	}
-
-	// 处理根节点的属
-	for _, attr := range root.Attrs {
-		// 跳过已知属
-		if isStandardManifestAttr(attr.Name.Local) {
-			continue
+// validateProjectTree 递归校验项目 name 与显式 path（上游 _CheckLocalPath 等价）。
+// name 始终必填；path 仅在显式声明时校验（缺省取 name 已在别处补全且 name 已校验）。
+func validateProjectTree(projects []Project) error {
+	for i := range projects {
+		proj := &projects[i]
+		if msg := checkLocalPath(proj.Name, true, false); msg != "" {
+			return &ManifestError{
+				Op:  "parse",
+				Err: fmt.Errorf("project %q invalid name %q: %s", proj.Name, proj.Name, msg),
+			}
 		}
-		// 存储自定义属
-		manifest.CustomAttrs[attr.Name.Local] = attr.Value
+		if proj.Path != "" {
+			if msg := checkLocalPath(proj.Path, true, true); msg != "" {
+				return &ManifestError{
+					Op:  "parse",
+					Err: fmt.Errorf("project %q invalid path %q: %s", proj.Name, proj.Path, msg),
+				}
+			}
+		}
+		if err := validateProjectTree(proj.Projects); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// badLocalPathCodepoints 是文件系统规范化时可能被忽略的 Unicode 码点集合
+// （对齐上游 _CheckLocalPath，来源 jgit ObjectChecker）。
+var badLocalPathCodepoints = map[rune]bool{
+	'\u200c': true, '\u200d': true, '\u200e': true, '\u200f': true,
+	'\u202a': true, '\u202b': true, '\u202c': true, '\u202d': true,
+	'\u202e': true, '\u206a': true, '\u206b': true, '\u206c': true,
+	'\u206d': true, '\u206e': true, '\u206f': true, '\ufeff': true,
+}
+
+// checkLocalPath 校验路径组件是否可安全用于文件系统（上游 _CheckLocalPath 等价）：
+//   - 不得为空、不得包含 "~"、不得包含可能被文件系统规范化的 Unicode 码点或换行；
+//   - 组件（大小写不敏感）不得为 "."、"..",".git"，不得以 ".repo" 开头；
+//   - dirOK 为 false 时不得以路径分隔符结尾；
+//   - 归一化后不得为绝对路径或逃逸到上层目录（".." 开头）。
+//
+// cwdDotOK 为 true 时允许路径恰为 "."（上游 project path 的约定）。
+// 返回空字符串表示合法，否则返回与上游一致的错误描述。
+func checkLocalPath(p string, dirOK, cwdDotOK bool) string {
+	if p == "" {
+		return "empty paths not allowed"
+	}
+	if strings.ContainsRune(p, '~') {
+		return "~ not allowed (due to 8.3 filenames on Windows filesystems)"
+	}
+	for _, r := range p {
+		if badLocalPathCodepoints[r] {
+			return "Unicode combining characters not allowed"
+		}
+	}
+	if strings.ContainsAny(p, "\r\n") {
+		return "Newlines not allowed"
 	}
 
-	// 处理子节
-	for _, node := range root.Nodes {
-		switch node.XMLName.Local {
-		case "remote":
-			// 查找匹配的远程仓
-			var name string
-			for _, attr := range node.Attrs {
-				if attr.Name.Local == "name" {
-					name = attr.Value
+	lower := strings.ToLower(p)
+	trailingSep := strings.HasSuffix(lower, "/") || strings.HasSuffix(lower, string(filepath.Separator))
+	trimmed := strings.TrimRight(lower, "/"+string(filepath.Separator))
+
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == '/' || r == rune(filepath.Separator)
+	})
+	// 注意：FieldsFunc 会丢掉空组件；绝对路径通过 IsAbs/前缀判断另行拦截。
+	dotAllowed := cwdDotOK && len(parts) == 1 && parts[0] == "."
+	if !dotAllowed {
+		for _, part := range parts {
+			if part == "." || part == ".." || part == ".git" || strings.HasPrefix(part, ".repo") {
+				return fmt.Sprintf("bad component: %s", part)
+			}
+		}
+	}
+	if !dirOK && trailingSep {
+		return "dirs not allowed"
+	}
+
+	norm := filepath.Clean(lower)
+	// Windows 根路径 "\foo"（以及 UNC "\\server\share"）在类 Unix 主机上
+	// filepath.IsAbs 不成立，需显式拒绝，避免跨平台校验结果不一致。
+	if strings.HasPrefix(lower, `\`) || strings.HasPrefix(norm, `\`) {
+		return "path cannot be outside"
+	}
+	if norm == ".." || strings.HasPrefix(norm, ".."+string(filepath.Separator)) ||
+		filepath.IsAbs(norm) || strings.HasPrefix(norm, "/") {
+		return "path cannot be outside"
+	}
+	return ""
+}
+
+// normalizeManifestPath 去掉 path/name 末尾的 "/"（可重复）。清单语义中
+// "foo" 与 "foo/" 是同一路径；归一化保证去重、duplicate path 校验、ToXML
+// 输出与 diff 键（以 path 为键）一致。
+func normalizeManifestPath(s string) string {
+	if s == "" {
+		return ""
+	}
+	trimmed := strings.TrimRight(s, "/")
+	if trimmed == "" {
+		// 全部由 "/" 构成（非法路径）：保持原值，交由路径校验报错。
+		return s
+	}
+	return trimmed
+}
+
+type manifestXMLNode struct {
+	XMLName xml.Name          `xml:""`
+	Attrs   []xml.Attr        `xml:",any,attr"`
+	Nodes   []manifestXMLNode `xml:",any"`
+}
+
+// xmlAttrValue 返回节点指定属性的值（不存在时为空）。
+func xmlAttrValue(node manifestXMLNode, name string) string {
+	for _, attr := range node.Attrs {
+		if attr.Name.Local == name {
+			return attr.Value
+		}
+	}
+	return ""
+}
+
+// copyUnknownAttrs 将节点中非已知属性写入 dst。
+func copyUnknownAttrs(node manifestXMLNode, dst map[string]string, known func(string) bool) {
+	for _, attr := range node.Attrs {
+		if !known(attr.Name.Local) {
+			dst[attr.Name.Local] = attr.Value
+		}
+	}
+}
+
+// projectMatchesXMLNode 按 name（必选）+ path（可选）匹配项目：
+//   - 节点显式指定 path：name 与有效 path 都必须匹配；
+//   - 节点未指定 path（上游自定义属性常见写法）：仅匹配“有效 path == name”
+//     的项目，避免对同名不同 path 的项目串写属性。
+func projectMatchesXMLNode(p *Project, name, projectPath string) bool {
+	if p.Name != name {
+		return false
+	}
+	eff := p.Path
+	if eff == "" {
+		eff = p.Name
+	}
+	if projectPath == "" {
+		return eff == name
+	}
+	return eff == projectPath
+}
+
+// applyProjectNodeAttrs 把 XML project 节点的自定义属性/copyfile/linkfile 属性
+// 写入对应项目，并递归处理嵌套子项目（name+path 匹配）。
+func applyProjectNodeAttrs(p *Project, node manifestXMLNode) {
+	if p.CustomAttrs == nil {
+		p.CustomAttrs = make(map[string]string)
+	}
+	copyUnknownAttrs(node, p.CustomAttrs, isKnownProjectAttr)
+	for _, subNode := range node.Nodes {
+		switch subNode.XMLName.Local {
+		case "copyfile":
+			src := xmlAttrValue(subNode, "src")
+			dest := xmlAttrValue(subNode, "dest")
+			for j := range p.Copyfiles {
+				if p.Copyfiles[j].Src == src && p.Copyfiles[j].Dest == dest {
+					if p.Copyfiles[j].CustomAttrs == nil {
+						p.Copyfiles[j].CustomAttrs = make(map[string]string)
+					}
+					copyUnknownAttrs(subNode, p.Copyfiles[j].CustomAttrs, isKnownCopyfileAttr)
 					break
 				}
 			}
-			// 找到匹配的远程仓库并添加自定义属
-			for i, remote := range manifest.Remotes {
-				if remote.Name == name {
-					for _, attr := range node.Attrs {
-						if !isKnownRemoteAttr(attr.Name.Local) {
-							manifest.Remotes[i].CustomAttrs[attr.Name.Local] = attr.Value
-						}
+		case "linkfile":
+			src := xmlAttrValue(subNode, "src")
+			dest := xmlAttrValue(subNode, "dest")
+			for j := range p.Linkfiles {
+				if p.Linkfiles[j].Src == src && p.Linkfiles[j].Dest == dest {
+					if p.Linkfiles[j].CustomAttrs == nil {
+						p.Linkfiles[j].CustomAttrs = make(map[string]string)
 					}
+					copyUnknownAttrs(subNode, p.Linkfiles[j].CustomAttrs, isKnownLinkfileAttr)
+					break
+				}
+			}
+		case "project":
+			name := xmlAttrValue(subNode, "name")
+			childPath := xmlAttrValue(subNode, "path")
+			for j := range p.Projects {
+				if projectMatchesXMLNode(&p.Projects[j], name, childPath) {
+					applyProjectNodeAttrs(&p.Projects[j], subNode)
+				}
+			}
+		}
+	}
+}
+
+// parseCustomAttributes 解析XML中的自定义属性。project/remove-project 按
+// name+path 匹配（同名不同 path 的项目不再互相串写属性）。
+func parseCustomAttributes(data []byte, manifest *Manifest) error {
+	var root manifestXMLNode
+	if err := xml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("解析XML失败: %w", err)
+	}
+
+	for _, attr := range root.Attrs {
+		if isStandardManifestAttr(attr.Name.Local) {
+			continue
+		}
+		manifest.CustomAttrs[attr.Name.Local] = attr.Value
+	}
+
+	for _, node := range root.Nodes {
+		switch node.XMLName.Local {
+		case "remote":
+			name := xmlAttrValue(node, "name")
+			for i := range manifest.Remotes {
+				if manifest.Remotes[i].Name == name {
+					copyUnknownAttrs(node, manifest.Remotes[i].CustomAttrs, isKnownRemoteAttr)
 					break
 				}
 			}
 		case "default":
-			// 处理默认设置的自定义属
-			for _, attr := range node.Attrs {
-				if !isKnownDefaultAttr(attr.Name.Local) {
-					manifest.Default.CustomAttrs[attr.Name.Local] = attr.Value
-				}
-			}
+			copyUnknownAttrs(node, manifest.Default.CustomAttrs, isKnownDefaultAttr)
 		case "project":
-			// 查找匹配的项
-			var name string
-			for _, attr := range node.Attrs {
-				if attr.Name.Local == "name" {
-					name = attr.Value
-					break
-				}
-			}
-			// 找到匹配的项目并添加自定义属
-			for i, project := range manifest.Projects {
-				if project.Name == name {
-					for _, attr := range node.Attrs {
-						if !isKnownProjectAttr(attr.Name.Local) {
-							manifest.Projects[i].CustomAttrs[attr.Name.Local] = attr.Value
-						}
-					}
-					// 处理项目的子节点（copyfile和linkfile
-					for _, subNode := range node.Nodes {
-						switch subNode.XMLName.Local {
-						case "copyfile":
-							// 查找匹配的copyfile
-							var src, dest string
-							for _, attr := range subNode.Attrs {
-								switch attr.Name.Local {
-								case "src":
-									src = attr.Value
-								case "dest":
-									dest = attr.Value
-								}
-							}
-							// 找到匹配的copyfile并添加自定义属
-							for j, copyfile := range manifest.Projects[i].Copyfiles {
-								if copyfile.Src == src && copyfile.Dest == dest {
-									for _, attr := range subNode.Attrs {
-										if !isKnownCopyfileAttr(attr.Name.Local) {
-											manifest.Projects[i].Copyfiles[j].CustomAttrs[attr.Name.Local] = attr.Value
-										}
-									}
-									break
-								}
-							}
-						case "linkfile":
-							// 查找匹配的linkfile
-							var src, dest string
-							for _, attr := range subNode.Attrs {
-								switch attr.Name.Local {
-								case "src":
-									src = attr.Value
-								case "dest":
-									dest = attr.Value
-								}
-							}
-							// 找到匹配的linkfile并添加自定义属
-							for j, linkfile := range manifest.Projects[i].Linkfiles {
-								if linkfile.Src == src && linkfile.Dest == dest {
-									for _, attr := range subNode.Attrs {
-										if !isKnownLinkfileAttr(attr.Name.Local) {
-											manifest.Projects[i].Linkfiles[j].CustomAttrs[attr.Name.Local] = attr.Value
-										}
-									}
-									break
-								}
-							}
-						}
-					}
-					break
+			name := xmlAttrValue(node, "name")
+			projectPath := xmlAttrValue(node, "path")
+			for i := range manifest.Projects {
+				if projectMatchesXMLNode(&manifest.Projects[i], name, projectPath) {
+					applyProjectNodeAttrs(&manifest.Projects[i], node)
 				}
 			}
 		case "include":
-			// 查找匹配的include
-			var name string
-			for _, attr := range node.Attrs {
-				if attr.Name.Local == "name" {
-					name = attr.Value
-					break
-				}
-			}
-			// 找到匹配的include并添加自定义属
-			for i, include := range manifest.Includes {
-				if include.Name == name {
-					for _, attr := range node.Attrs {
-						if !isKnownIncludeAttr(attr.Name.Local) {
-							manifest.Includes[i].CustomAttrs[attr.Name.Local] = attr.Value
-						}
-					}
+			name := xmlAttrValue(node, "name")
+			for i := range manifest.Includes {
+				if manifest.Includes[i].Name == name {
+					copyUnknownAttrs(node, manifest.Includes[i].CustomAttrs, isKnownIncludeAttr)
 					break
 				}
 			}
 		case "remove-project":
-			// 查找匹配的remove-project
-			var name string
-			for _, attr := range node.Attrs {
-				if attr.Name.Local == "name" {
-					name = attr.Value
-					break
-				}
-			}
-			// 找到匹配的remove-project并添加自定义属
-			for i, removeProject := range manifest.RemoveProjects {
-				if removeProject.Name == name {
-					for _, attr := range node.Attrs {
-						if !isKnownRemoveProjectAttr(attr.Name.Local) {
-							manifest.RemoveProjects[i].CustomAttrs[attr.Name.Local] = attr.Value
-						}
-					}
+			name := xmlAttrValue(node, "name")
+			removePath := xmlAttrValue(node, "path")
+			for i := range manifest.RemoveProjects {
+				if manifest.RemoveProjects[i].Name == name &&
+					(removePath == "" || manifest.RemoveProjects[i].Path == removePath) {
+					copyUnknownAttrs(node, manifest.RemoveProjects[i].CustomAttrs, isKnownRemoveProjectAttr)
 					break
 				}
 			}
@@ -1309,13 +1854,44 @@ func findTopLevelRepoDir(startDir string) string {
 	return ""
 }
 
+// applyIncludeInheritance 把当前 include 链继承的 groups/revision 应用到本清单：
+//   - revision 补到未声明 revision 的顶层 project 与嵌套 include（上游
+//     _ParseManifestXml 对 include/project 节点 setAttribute 的行为）；
+//   - groups 与顶层 project/extend-project 的已有组取并集（上游 parent_groups
+//     对 project/extend-project 节点的处理）。嵌套子项目不继承，与上游一致。
+func (p *Parser) applyIncludeInheritance(m *Manifest) {
+	if p.includeRevision != "" {
+		for i := range m.Projects {
+			if m.Projects[i].Revision == "" {
+				m.Projects[i].Revision = p.includeRevision
+			}
+		}
+		for i := range m.Includes {
+			if m.Includes[i].Revision == "" {
+				m.Includes[i].Revision = p.includeRevision
+			}
+		}
+	}
+	if len(p.includeGroups) == 0 {
+		return
+	}
+	groups := strings.Join(p.includeGroups, ",")
+	for i := range m.Projects {
+		m.Projects[i].Groups = unionGroupStrings(m.Projects[i].Groups, groups)
+	}
+	for i := range m.ExtendProjects {
+		m.ExtendProjects[i].Groups = unionGroupStrings(m.ExtendProjects[i].Groups, groups)
+	}
+}
+
 // processIncludes 处理包含的清单文件。上游将 include 的内容按文档顺序并入
-// 同一节点流（子清单的 default/remove 对全局生效）；本实现的递归聚合模型
-// 通过以下机制对齐：
+// 同一节点流（子清单的 default/remove/extend 对全局生效）；本实现的递归
+// 聚合模型通过以下机制对齐：
 //   - 子清单项目在递归 Parse 中应用其自身 default，缺省值再由外层
 //     applyProjectDefaults 补全；
-//   - 子清单中无法在子清单内匹配的 remove-project（悬空 remove，
-//     目标在外层清单）通过 includeSeg 向外传播，在外层重放时执行；
+//   - 子清单按文档顺序解析后记录操作日志（project/remove/extend），由
+//     includeSeg 携带，父层在 include 位置逐元素重放，保留 remove 后重新
+//     定义等顺序语义；
 //   - 子清单 <notice> 合并进外层（上游 repo sync 会打印所有清单的 notice）。
 func (p *Parser) processIncludes(manifest *Manifest, groups []string) ([]includeSeg, error) {
 	// 获取当前working directory
@@ -1386,10 +1962,19 @@ func (p *Parser) processIncludes(manifest *Manifest, groups []string) ([]include
 		}
 
 		// failed to parse included manifest
-		// 被解析的文件位于 include 链内：其中悬空的 remove-project 不视为错误
+		// 被解析的文件位于 include 链内：其中悬空的 remove-project 不视为错误。
+		// include 的 groups/revision 通过 Parser 状态下传：groups 与祖先 include
+		// 的组取并集后作用于被包含清单的 project/extend-project；revision 补到
+		// 未声明 revision 的项目与嵌套 include（对齐上游 _ParseManifestXml）。
+		prevRevision := p.includeRevision
+		prevGroups := p.includeGroups
+		p.includeRevision = include.Revision
+		p.includeGroups = unionGroupLists(prevGroups, splitTrimGroups(include.Groups))
 		p.includeDepth++
-		includedManifest, err := p.Parse(data, groups)
+		includedManifest, err := p.Parse(data, nil)
 		p.includeDepth--
+		p.includeRevision = prevRevision
+		p.includeGroups = prevGroups
 		// 解析完成后移除访问记录，允许在其他路径中再次包含
 		p.removeVisitedFile(includeName)
 		if err != nil {
@@ -1414,11 +1999,14 @@ func (p *Parser) processIncludes(manifest *Manifest, groups []string) ([]include
 			}
 		}
 
-		// 记录本 include 引入的项目区间；子清单中无法匹配的悬空
-		// remove-project 交由外层重放时执行
+		// 记录本 include 引入的项目区间；同时携带子清单的文档顺序操作
+		// 日志，父层据此在 include 位置逐元素重放（保留 remove/重新定义
+		// 等顺序语义）。removes/extends 仅作为无操作日志时的兜底。
 		seg := includeSeg{
 			start:   len(manifest.Projects),
 			removes: includedManifest.RemoveProjects,
+			extends: includedManifest.ExtendProjects,
+			ops:     includedManifest.replayOps,
 		}
 		manifest.Projects = append(manifest.Projects, includedManifest.Projects...)
 		seg.end = len(manifest.Projects)
@@ -1479,15 +2067,18 @@ func cleanNotice(s string) string {
 
 // topElem 记录主清单顶层子元素的出现顺序与类别
 type topElem struct {
-	kind string // "project" / "include" / "remove-project"
+	kind string // "project" / "include" / "remove-project" / "extend-project"
 	idx  int    // 在对应 Unmarshal 结果切片中的序号
 }
 
 // includeSeg 记录单个 <include> 引入的项目在 Projects 切片中的区间，
-// 以及子清单中无法在其内部匹配的悬空 remove-project（目标在外层清单）
+// 以及子清单按文档顺序解析后的操作日志（project/remove/extend），供父层
+// 在 include 位置逐元素重放。removes/extends 为无操作日志时的兜底。
 type includeSeg struct {
 	start, end int
 	removes    []RemoveProject
+	extends    []ExtendProject
+	ops        []replayOp
 }
 
 // scanTopLevelElements 扫描 manifest 根元素的直接子元素，按文档顺序记录
@@ -1496,7 +2087,7 @@ type includeSeg struct {
 // remove-project 的上游语义（只移除此前已定义的项目）依赖该顺序，故需重扫。
 func scanTopLevelElements(data []byte) []topElem {
 	seq := make([]topElem, 0)
-	projIdx, incIdx, rmIdx := 0, 0, 0
+	projIdx, incIdx, rmIdx, extIdx := 0, 0, 0, 0
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	depth := 0
 	for {
@@ -1519,6 +2110,9 @@ func scanTopLevelElements(data []byte) []topElem {
 				case "remove-project":
 					seq = append(seq, topElem{kind: "remove-project", idx: rmIdx})
 					rmIdx++
+				case "extend-project":
+					seq = append(seq, topElem{kind: "extend-project", idx: extIdx})
+					extIdx++
 				}
 			}
 		case xml.EndElement:
@@ -1528,168 +2122,366 @@ func scanTopLevelElements(data []byte) []topElem {
 	return seq
 }
 
-// applyRemoveProjects 按文档顺序重放顶层元素：project/include 依序激活项目，
-// remove-project 即时移除此前已定义的匹配项目，对齐上游语义：
-//   - name 指定而 path 未指定：移除所有同名项目；
-//   - path 指定：移除 path 匹配且（name 匹配或 name 未指定）的项目；
-//   - name 与 path 均未指定：报错；
-//   - 无匹配且 optional 不为 true：顶层解析报错；位于 include 链内时
-//     视为悬空 remove（目标在外层清单），保留在 RemoveProjects 字段中
-//     由 processIncludes 向外传播；
-//   - 已生效的 remove 从 RemoveProjects 字段移除（项目已被删除，快照无需再输出）。
-func (p *Parser) applyRemoveProjects(m *Manifest, seq []topElem, segs []includeSeg) error {
-	hasRemoves := len(m.RemoveProjects) > 0
-	for _, seg := range segs {
-		if len(seg.removes) > 0 {
-			hasRemoves = true
-			break
-		}
-	}
-	if !hasRemoves {
-		// 无任何 remove 声明：仅展平嵌套子项目
-		flattenNestedProjects(m)
-		return nil
-	}
+// replayOp 描述清单文档顺序中的一个顶层操作：project 携带展平后的项目，
+// remove/extend 保留原条目。父清单据此在 include 位置逐元素重放。
+type replayOp struct {
+	kind     string // "project" / "remove" / "extend"
+	projects []Project
+	remove   RemoveProject
+	extend   ExtendProject
+}
 
+// replayDocumentOrder 按文档顺序重放顶层元素：project/include/
+// remove-project/extend-project 依序执行。include 段通过子清单记录的操作
+// 日志逐元素重放，因此“remove a → 重新定义 a”不会被整段追加后的 remove
+// 误删。返回本层文档顺序的操作日志，供父清单在 include 位置再次重放。
+func (p *Parser) replayDocumentOrder(m *Manifest, seq []topElem, segs []includeSeg) ([]replayOp, error) {
 	flat := make([]Project, 0, len(m.Projects))
+	ops := make([]replayOp, 0, len(seq))
 	projCursor := 0 // 主清单顶层项目游标
 	incIdx := 0     // include 段游标
 
-	// 悬空 remove：include 段内未匹配且非 optional 的条目，回填到本层
-	// RemoveProjects 字段供更外层传播
-	dangling := make([]RemoveProject, 0)
+	// inInclude: 当前清单由 include 链引入。此时 remove/extend 仍按位置在
+	// 子层项目集合上求值（兼容 Merger 与悬空条目），但 base-rev 校验推迟：
+	// 只有父层在 include 位置重放时，父 remote/default 才是正确上下文。
+	inInclude := p.includeDepth > 0
 
-	execRemove := func(rp RemoveProject) {
-		if removeMatches(&flat, rp) {
-			return
+	// seenNames 记录本层曾经定义过的项目名：include 传播的未命中 extend
+	// 若目标曾被定义（但随后被 remove 删除），应丢弃而非误报不存在。
+	seenNames := make(map[string]bool)
+	dangling := make([]RemoveProject, 0)
+	pendingExtends := make([]ExtendProject, 0)
+	unmatchedExtends := make([]ExtendProject, 0)
+	// positionalUnresolved 记录 include 传播、在当前位置未命中的 extend 的
+	// op 下标。它们不得延后应用到之后才定义的项目，文档末尾再决定丢弃/报错。
+	positionalUnresolved := make([]int, 0)
+
+	nameInFlat := func(name string) bool {
+		name = normalizeManifestPath(name)
+		for i := range flat {
+			if normalizeManifestPath(flat[i].Name) == name {
+				return true
+			}
 		}
-		// 无匹配：保留为悬空条目（optional 或递归层交由外层/合并器处理）
-		dangling = append(dangling, rp)
+		return false
+	}
+
+	addProject := func(proj Project) {
+		withChildren := appendProjectWithChildren(nil, proj)
+		for i := range withChildren {
+			seenNames[normalizeManifestPath(withChildren[i].Name)] = true
+		}
+		flat = append(flat, withChildren...)
+		ops = append(ops, replayOp{kind: "project", projects: withChildren})
+	}
+
+	execRemove := func(rp RemoveProject) error {
+		// include 子层仍在自身项目集合上执行 remove（供 Merger/悬空条目
+		// 兼容），但 base-rev 校验延后到父层重放位置。
+		matched, err := removeMatches(m, &flat, rp, !inInclude)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			// 无匹配：悬空条目（optional 或交由外层/合并器处理）
+			dangling = append(dangling, rp)
+		}
+		// 始终记录 remove：父层按 include 位置重放时，才能保留对更早定义
+		// 项目的删除效果（include 等价于文档内联展开）。
+		ops = append(ops, replayOp{kind: "remove", remove: rp})
+		return nil
+	}
+
+	execExtend := func(ep ExtendProject, fromInclude bool) error {
+		// include 子层在自身项目集合上按位置求值（不延后到文档末尾），且
+		// base-rev 校验延后到父层。ops 中的 project 快照在 extend 之前捕获，
+		// 因此 extend 不会被“烧进”快照；父层按 include 位置重放即可复现。
+		matched, nameExists, err := applyExtendProjectToSlice(m, &flat, ep, !inInclude)
+		if err != nil {
+			return err
+		}
+		if matched {
+			ops = append(ops, replayOp{kind: "extend", extend: ep})
+			return nil
+		}
+		if inInclude || fromInclude {
+			// 位置语义：未命中不得延后应用到之后定义的项目。记录 op 供父层
+			// 在 include 位置重放；path 无命中但同名项目可见时也一样，因为
+			// 父层可能存在 path 匹配的项目。
+			ep.fromInclude = true
+			ops = append(ops, replayOp{kind: "extend", extend: ep})
+			if inInclude {
+				unmatchedExtends = append(unmatchedExtends, ep)
+			} else {
+				positionalUnresolved = append(positionalUnresolved, len(ops)-1)
+			}
+			return nil
+		}
+		if nameExists {
+			// name 存在但 path 无命中：no-op，不报告“项目不存在”。
+			return nil
+		}
+		// 未命中：目标可能在更后的文档位置定义、已被后续 remove 删除，
+		// 或位于外层清单。延后到文档末尾统一判定。
+		pendingExtends = append(pendingExtends, ep)
+		return nil
+	}
+
+	replayInclude := func(seg includeSeg) error {
+		if seg.ops != nil {
+			for _, op := range seg.ops {
+				switch op.kind {
+				case "project":
+					for _, proj := range op.projects {
+						addProject(proj)
+					}
+				case "remove":
+					if err := execRemove(op.remove); err != nil {
+						return err
+					}
+				case "extend":
+					ep := op.extend
+					ep.fromInclude = true
+					if err := execExtend(ep, true); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		// 兜底：旧格式 includeSeg（无操作日志）按区间 + 悬空条目应用。
+		if seg.start >= 0 && seg.start <= seg.end && seg.end <= len(m.Projects) {
+			for _, proj := range m.Projects[seg.start:seg.end] {
+				addProject(proj)
+			}
+		}
+		for _, rp := range seg.removes {
+			if err := execRemove(rp); err != nil {
+				return err
+			}
+		}
+		for _, ep := range seg.extends {
+			ep.fromInclude = true
+			if err := execExtend(ep, true); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	for _, e := range seq {
 		switch e.kind {
 		case "project":
 			if projCursor < len(m.Projects) {
-				flat = appendProjectWithChildren(flat, m.Projects[projCursor])
+				addProject(m.Projects[projCursor])
 				projCursor++
 			}
 		case "include":
 			if incIdx < len(segs) {
-				seg := segs[incIdx]
-				incIdx++
-				flat = append(flat, m.Projects[seg.start:seg.end]...)
-				// 子清单悬空的 remove 在本层继续执行
-				for _, rp := range seg.removes {
-					execRemove(rp)
+				if err := replayInclude(segs[incIdx]); err != nil {
+					return nil, err
 				}
+				incIdx++
 			}
 		case "remove-project":
-			rp := m.RemoveProjects[e.idx]
-			if !removeMatches(&flat, rp) {
-				dangling = append(dangling, rp)
+			if e.idx < len(m.RemoveProjects) {
+				if err := execRemove(m.RemoveProjects[e.idx]); err != nil {
+					return nil, err
+				}
+			}
+		case "extend-project":
+			if e.idx < len(m.ExtendProjects) {
+				if err := execExtend(m.ExtendProjects[e.idx], false); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
-	// 兜底：seq 未覆盖到的剩余项目全部激活（正常流程应已被消费）
-	for ; projCursor < len(m.Projects); projCursor++ {
-		flat = appendProjectWithChildren(flat, m.Projects[projCursor])
+	// 兜底：seq 未覆盖到的剩余“直接项目”全部激活（正常流程应已被消费）。
+	// 上界必须排除 include 段引入的项目：m.Projects 由“主清单直接项目”加
+	// “include 段项目”拼接而成，若用 len(m.Projects) 作上界会把 include
+	// 项目再次追加，使已被 remove-project 删除的项目复活。
+	directProjectCount := len(m.Projects)
+	for _, seg := range segs {
+		directProjectCount -= seg.end - seg.start
+	}
+	if directProjectCount < 0 {
+		directProjectCount = 0
+	}
+	for ; projCursor < directProjectCount; projCursor++ {
+		addProject(m.Projects[projCursor])
 	}
 	for ; incIdx < len(segs); incIdx++ {
-		seg := segs[incIdx]
-		flat = append(flat, m.Projects[seg.start:seg.end]...)
-		for _, rp := range seg.removes {
-			execRemove(rp)
+		if err := replayInclude(segs[incIdx]); err != nil {
+			return nil, err
 		}
 	}
 
-	m.Projects = flat
+	// 文档末尾统一处理直接定义（非 include 传播）的未命中 extend：
+	//   - 目标出现在本层最终项目集合：应用；
+	//   - name 存在但 path 不匹配：no-op；
+	//   - 顶层清单中从未出现过的 extend：报错（上游 fail-fast）。
+	for _, ep := range pendingExtends {
+		matched, nameExists, err := applyExtendProjectToSlice(m, &flat, ep, true)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			ops = append(ops, replayOp{kind: "extend", extend: ep})
+			continue
+		}
+		if nameExists {
+			continue
+		}
+		return nil, &ManifestError{
+			Op:  "parse",
+			Err: fmt.Errorf("extend-project element specifies non-existent project: %s", ep.Name),
+		}
+	}
 
-	// 顶层解析时，悬空的非 optional remove 视为错误（上游 fail-fast：
-	// remove-project 引用了不存在的项目）。递归层（被 include/local
-	// manifest 引入的清单）保留悬空条目供外层执行。
-	if p.includeDepth == 0 {
-		for _, rp := range dangling {
-			if !rp.Optional {
-				return fmt.Errorf("remove-project element specifies non-existent project: name=%q path=%q", rp.Name, rp.Path)
+	// include 传播的未命中 extend 只按位置生效：文档末尾不再尝试应用，
+	// 否则会错误地作用到 include 位置之后才定义的项目。
+	//   - 目标最终存在或曾经出现（含已被 remove）：丢弃该 op；
+	//   - 目标从未出现：顶层报 “不存在”（上游 fail-fast）。
+	if len(positionalUnresolved) > 0 {
+		drop := make(map[int]bool, len(positionalUnresolved))
+		for _, opIdx := range positionalUnresolved {
+			ep := ops[opIdx].extend
+			if nameInFlat(ep.Name) || seenNames[normalizeManifestPath(ep.Name)] {
+				drop[opIdx] = true
+				continue
+			}
+			return nil, &ManifestError{
+				Op:  "parse",
+				Err: fmt.Errorf("extend-project element specifies non-existent project: %s", ep.Name),
 			}
 		}
+		if len(drop) > 0 {
+			kept := make([]replayOp, 0, len(ops)-len(drop))
+			for i := range ops {
+				if drop[i] {
+					continue
+				}
+				kept = append(kept, ops[i])
+			}
+			ops = kept
+		}
 	}
 
-	// 重建 RemoveProjects：仅保留悬空条目（供外层传播与合并器执行）
-	m.RemoveProjects = dangling
-	return nil
+	// 顶层解析时，悬空的非 optional remove 视为错误（上游 fail-fast：
+	// remove-project 引用了不存在的项目）。校验后清空残留条目：写盘顺序
+	// 变成“项目在前、remove 在后”，保留它们会让二次解析重新生效或报错。
+	// include 子层保留悬空条目，由父层在 include 位置执行。
+	if p.includeDepth == 0 {
+		for _, rp := range dangling {
+			if !rp.Optional.Get(false) {
+				return nil, fmt.Errorf("remove-project element specifies non-existent project: name=%q path=%q", rp.Name, rp.Path)
+			}
+		}
+		m.RemoveProjects = nil
+	} else {
+		m.RemoveProjects = dangling
+	}
+	m.Projects = flat
+	m.ExtendProjects = unmatchedExtends
+	return ops, nil
 }
 
 // removeMatches 从已定义项目列表中移除匹配 remove-project 的项目，返回是否
 // 发生了移除。匹配规则对齐上游：
 //   - name 与 path 均未指定视为非法（上游直接报错），此处返回 false；
 //   - name 指定而 path 未指定：移除所有同名项目；
-//   - path 指定：移除 path 匹配且（name 匹配或 name 未指定）的项目。
-func removeMatches(projects *[]Project, rp RemoveProject) bool {
+//   - path 指定：移除 path 匹配且（name 匹配或 name 未指定）的项目；
+//   - base-rev 指定时，命中项目的有效 revision（project → remote → default）
+//     必须与 base-rev 一致，否则返回 base-revision mismatch 错误且不修改列表；
+//     validateBaseRev=false 用于 include 子层（外层 remote/default 尚不可知），
+//     校验推迟到父层在 include 位置重放时执行。
+func removeMatches(manifest *Manifest, projects *[]Project, rp RemoveProject, validateBaseRev bool) (bool, error) {
 	if rp.Name == "" && rp.Path == "" {
-		return false
+		return false, nil
 	}
+	rpName := normalizeManifestPath(rp.Name)
+	rpPath := normalizeManifestPath(rp.Path)
 	kept := make([]Project, 0, len(*projects))
 	removed := false
 	for _, proj := range *projects {
-		match := false
-		if rp.Path == "" {
-			// 仅 name：同名全部移除
-			match = proj.Name == rp.Name
-		} else {
-			// path 匹配且（name 匹配或 name 未指定）
-			match = proj.Path == rp.Path && (rp.Name == "" || proj.Name == rp.Name)
+		projName := normalizeManifestPath(proj.Name)
+		projectPath := normalizeManifestPath(proj.Path)
+		if projectPath == "" {
+			projectPath = projName
 		}
-		if match {
-			removed = true
+		match := false
+		if rpPath == "" {
+			// 仅 name：同名全部移除
+			match = projName == rpName
+		} else {
+			// path 匹配且（name 匹配或 name 未指定）。
+			// 项目 Path 为空时按 Name 视为隐式 path（对齐上游 path 缺省取 name）
+			match = projectPath == rpPath && (rpName == "" || projName == rpName)
+		}
+		if !match {
+			kept = append(kept, proj)
 			continue
 		}
-		kept = append(kept, proj)
+		if rp.BaseRev != "" && validateBaseRev {
+			current := effectiveProjectRevision(manifest, &proj)
+			if current != rp.BaseRev {
+				return false, &ManifestError{
+					Op: "parse",
+					Err: fmt.Errorf("detected base-revision mismatch, updates needed:\nremove-project name %s:\n  base %s vs revision %s",
+						rp.Name, rp.BaseRev, current),
+				}
+			}
+		}
+		removed = true
+	}
+	if !removed {
+		return false, nil
 	}
 	*projects = kept
-	return removed
+	return true, nil
 }
 
-// flattenNestedProjects 将嵌套 <project> 子项目（上游用其表达 Git submodule）
-// 展平进主项目列表：子项目紧跟其父之后。
-func flattenNestedProjects(m *Manifest) {
-	var hasNested bool
-	for i := range m.Projects {
-		if len(m.Projects[i].Projects) > 0 {
-			hasNested = true
-			break
+// removeProjectMatchesProjects 判断 remove-project 是否会命中给定的任一项目。
+// 用于 ToXML 写盘前过滤“会重新生效”的残留 remove 条目。
+func removeProjectMatchesProjects(projects []Project, rp RemoveProject) bool {
+	for _, proj := range projects {
+		if removeProjectMatchesProject(rp, proj) {
+			return true
 		}
 	}
-	if !hasNested {
-		return
-	}
-	flat := make([]Project, 0, len(m.Projects))
-	for _, proj := range m.Projects {
-		flat = appendProjectWithChildren(flat, proj)
-	}
-	m.Projects = flat
+	return false
 }
 
 // appendProjectWithChildren 将项目连同其嵌套子项目追加到列表，子项目按上游规则
 // 改写 name/path：
 //   - 子项目 name 为 "父name/子name"（上游 _JoinName）；
-//   - 子项目显式 path 相对父项目路径展开（上游 _JoinRelpath）；缺省时
-//     path 即带父名前缀的 name（上游 _ParseProject 的 path 缺省取 JoinName
-//     结果，再由 GetSubprojectPaths 与父路径拼接）；
+//   - 子项目路径 = 父项目路径 + "/" + path，其中 path 缺省时取“已拼接的
+//     name”（上游 _ParseProject: path = name；GetSubprojectPaths:
+//     relpath = _JoinRelpath(parent.relpath, path)）。因此深层缺省路径形如
+//     parent/parent/child/…，这是上游的实际行为，不是重复拼接 bug；
+//     显式 path 则相对父路径展开（上游 _JoinRelpath）。
 //   - 其余属性（remote/revision 等）留待 applyProjectDefaults 统一补全。
 func appendProjectWithChildren(dst []Project, proj Project) []Project {
 	children := proj.Projects
 	proj.Projects = nil // 展平后不再保留子树
+	// name/path 尾部 "/" 归一化：让 foo 与 foo/ 在展平、去重与重放中一致。
+	proj.Name = normalizeManifestPath(proj.Name)
+	proj.Path = normalizeManifestPath(proj.Path)
+	// 父项目 path 缺省即 name（与 applyProjectDefaults 一致）
+	if proj.Path == "" {
+		proj.Path = proj.Name
+	}
+	parentName := proj.Name
+	parentPath := proj.Path
 	dst = append(dst, proj)
 
-	// 父项目 path 缺省即 name（与 applyProjectDefaults 一致）
-	parentPath := proj.Path
-	if parentPath == "" {
-		parentPath = proj.Name
-	}
 	for _, child := range children {
-		child.Name = path.Join(proj.Name, child.Name)
+		originalName := child.Name
+		// 子项目 name = 父name/子name（上游 _JoinName）
+		child.Name = path.Join(parentName, originalName)
+		// 缺省 path 取拼接后的 name（上游 _ParseProject 的 path 缺省逻辑），
+		// 再由父路径拼接；显式 path 直接相对父路径展开。
 		if child.Path == "" {
 			child.Path = path.Join(parentPath, child.Name)
 		} else {
@@ -1703,79 +2495,124 @@ func appendProjectWithChildren(dst []Project, proj Project) []Project {
 	return dst
 }
 
-// applyExtendProjects 应用ExtendProject配置到现有项目
-func (p *Parser) applyExtendProjects(manifest *Manifest) error {
-	if len(manifest.ExtendProjects) == 0 {
-		return nil
-	}
-
-	// 创建项目名称到索引的映射
-	projectMap := make(map[string]int)
-	for i, proj := range manifest.Projects {
-		projectMap[proj.Name] = i
-		if proj.Path != "" && proj.Path != proj.Name {
-			projectMap[proj.Path] = i
+// applyExtendProjectToSlice 将单个 extend-project 应用到给定项目切片（就地
+// 修改），返回是否命中（matched）以及是否存在同名项目（nameExists）。
+// 匹配规则对齐上游：
+//   - name 必选；path 仅作为匹配条件（不改变项目路径），dest-path 才改路径；
+//   - 未指定 path 却指定 dest-path 且同名项目多于一个时报错；
+//   - groups 与项目现有组取并集（不替换）；
+//   - revision 变更时 base-rev 必须与当前有效 revision 一致，否则报错。
+//
+// nameExists 用于区分“项目完全不存在”（需要报错/向外传播）与“name 存在但
+// path 无命中”（no-op），后者不得误报“项目不存在”。
+//
+// validateBaseRev=false 用于 include 子层：此时外层 remote/default 尚未合并，
+// base-rev 校验推迟到父层在 include 位置重放时执行，避免合法清单误报。
+func applyExtendProjectToSlice(manifest *Manifest, projects *[]Project, extProj ExtendProject, validateBaseRev bool) (matched, nameExists bool, err error) {
+	extName := normalizeManifestPath(extProj.Name)
+	extPath := normalizeManifestPath(extProj.Path)
+	for i := range *projects {
+		if normalizeManifestPath((*projects)[i].Name) == extName {
+			nameExists = true
+			break
 		}
 	}
-
-	// 应用每个ExtendProject
-	for _, extProj := range manifest.ExtendProjects {
-		// 查找对应的项目
-		idx, found := projectMap[extProj.Name]
-		if !found {
-			// 如果通过name找不到，尝试通过path查找
-			if extProj.Path != "" {
-				idx, found = projectMap[extProj.Path]
+	if extProj.DestPath != "" && extProj.Path == "" {
+		sameName := 0
+		for i := range *projects {
+			if normalizeManifestPath((*projects)[i].Name) == extName {
+				sameName++
 			}
 		}
-
-		if !found {
-			// ExtendProject引用的项目不存在，记录警告并跳过
-			if !p.silentMode {
-				fmt.Fprintf(os.Stderr, "警告: extend-project引用的项目 %s 不存在，已跳过\n", extProj.Name)
+		if sameName > 1 {
+			return false, nameExists, &ManifestError{
+				Op:  "parse",
+				Err: fmt.Errorf("extend-project cannot use dest-path when matching multiple projects: %s", extProj.Name),
 			}
+		}
+	}
+
+	for i := range *projects {
+		proj := &(*projects)[i]
+		if normalizeManifestPath(proj.Name) != extName {
 			continue
 		}
-
-		// 应用扩展配置（增量更新，而非覆盖）
-		proj := &manifest.Projects[idx]
-
-		// 更新path（如果指定）
-		if extProj.Path != "" {
-			proj.Path = extProj.Path
+		if extPath != "" {
+			projectPath := normalizeManifestPath(proj.Path)
+			if projectPath == "" {
+				projectPath = normalizeManifestPath(proj.Name)
+			}
+			if projectPath != extPath {
+				continue
+			}
 		}
 
-		// 更新groups（如果指定）
-		if extProj.Groups != "" {
-			proj.Groups = extProj.Groups
-		}
-
-		// 更新revision（如果指定）
 		if extProj.Revision != "" {
+			if extProj.BaseRev != "" && validateBaseRev {
+				current := effectiveProjectRevision(manifest, proj)
+				if current != extProj.BaseRev {
+					return false, nameExists, &ManifestError{
+						Op: "parse",
+						Err: fmt.Errorf("extend-project name %s: base %s vs revision %s",
+							extProj.Name, extProj.BaseRev, current),
+					}
+				}
+			}
 			proj.Revision = extProj.Revision
 		}
-
-		// 更新remote（如果指定）
 		if extProj.Remote != "" {
 			proj.Remote = extProj.Remote
 		}
-
+		if extProj.DestBranch != "" {
+			proj.DestBranch = extProj.DestBranch
+		}
+		if extProj.Upstream != "" {
+			proj.Upstream = extProj.Upstream
+		}
+		// dest-path 修改项目路径（path 属性仅用于匹配）
+		if extProj.DestPath != "" {
+			proj.Path = normalizeManifestPath(extProj.DestPath)
+		}
+		// groups 取并集
+		if extProj.Groups != "" {
+			proj.Groups = unionGroupStrings(proj.Groups, extProj.Groups)
+		}
 		// 追加copyfiles
 		if len(extProj.Copyfiles) > 0 {
 			proj.Copyfiles = append(proj.Copyfiles, extProj.Copyfiles...)
 		}
-
 		// 追加linkfiles
 		if len(extProj.Linkfiles) > 0 {
 			proj.Linkfiles = append(proj.Linkfiles, extProj.Linkfiles...)
 		}
+		matched = true
 	}
-
-	return nil
+	return matched, nameExists, nil
 }
 
-// processLocalManifests 处理.repo/local_manifests目录下的所有manifest文件
+// effectiveProjectRevision 返回项目当前有效 revision（project → remote →
+// default），用于 extend-project base-rev 校验。applyProjectDefaults 之前也可用。
+func effectiveProjectRevision(manifest *Manifest, proj *Project) string {
+	if proj.Revision != "" {
+		return proj.Revision
+	}
+	remoteName := proj.Remote
+	if remoteName == "" {
+		remoteName = manifest.Default.Remote
+	}
+	if remote := manifest.findRemote(remoteName); remote != nil && remote.Revision != "" {
+		return remote.Revision
+	}
+	return manifest.Default.Revision
+}
+
+// processLocalManifests 处理.repo/local_manifests目录下的所有manifest文件。
+// 仅允许在最外层 Parse（parseDepth==1）执行；递归解析 local manifest 时
+// 不得再次扫描该目录，否则会无限递归。
 func (p *Parser) processLocalManifests(manifest *Manifest, groups []string) error {
+	if p.parseDepth > 1 {
+		return nil
+	}
 	// 获取当前working directory
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -1819,42 +2656,51 @@ func (p *Parser) processLocalManifests(manifest *Manifest, groups []string) erro
 	for _, xmlFile := range xmlFiles {
 		data, err := os.ReadFile(xmlFile)
 		if err != nil {
-			// 读取failed，记录警告并继续
-			if !p.silentMode {
-				fmt.Fprintf(os.Stderr, "警告: 读取local manifest文件 %s 失败 (%v)，已跳过\n", xmlFile, err)
-			}
-			continue
+			return fmt.Errorf("failed to read local manifest %s: %w", xmlFile, err)
 		}
 
-		// 解析local manifest：其 remove-project 的目标通常在主清单中，
-		// 独立解析时无法匹配，须以子清单上下文（悬空保留）解析，
-		// 由 mergeLocalManifest 在主清单上执行
+		// 解析local manifest：以 fragment 模式保留顶层元素文档顺序与原始
+		// 切片下标（remove/extend 不在此应用），再由 mergeLocalManifest
+		// 按 local XML 顺序重放到主清单。includeDepth++ 表示其悬空
+		// remove/extend 目标可能在外层清单，不应在此报错。
+		prevFragment := p.localFragment
+		p.localFragment = true
 		p.includeDepth++
-		localManifest, err := p.Parse(data, groups)
+		localManifest, err := p.Parse(data, nil)
 		p.includeDepth--
+		p.localFragment = prevFragment
 		if err != nil {
-			// 解析failed，记录警告并继续
-			if !p.silentMode {
-				fmt.Fprintf(os.Stderr, "警告: 解析local manifest文件 %s 失败 (%v)，已跳过\n", xmlFile, err)
-			}
-			continue
+			return fmt.Errorf("failed to parse local manifest %s: %w", xmlFile, err)
 		}
 
-		// 合并到主manifest
+		// 合并到主manifest（事务性：失败时主清单保持不变）
 		if err := p.mergeLocalManifest(manifest, localManifest); err != nil {
-			// 合并failed，记录警告并继续
-			if !p.silentMode {
-				fmt.Fprintf(os.Stderr, "警告: 合并local manifest %s 失败 (%v)，已跳过\n", xmlFile, err)
-			}
-			continue
+			return fmt.Errorf("failed to merge local manifest %s: %w", xmlFile, err)
 		}
 	}
 
 	return nil
 }
 
-// mergeLocalManifest 将local manifest合并到主manifest
+// mergeLocalManifest 将local manifest合并到主manifest。
+// 合并是事务性的：在 main 的深拷贝上完整重放，仅当全部成功才替换 main；
+// 失败时返回错误且不改动 main，避免半失败留下部分覆盖。
+// remove-project 使用与解析期一致的 path/optional 匹配语义：
+// path 为空按 Name 视为隐式 path；非 optional 且未命中视为错误。
 func (p *Parser) mergeLocalManifest(main *Manifest, local *Manifest) error {
+	if main == nil || local == nil {
+		return fmt.Errorf("local manifest merge requires non-nil manifests")
+	}
+	working := deepCopyManifest(main)
+	if err := p.mergeLocalManifestInto(working, local); err != nil {
+		return err
+	}
+	*main = *working
+	return nil
+}
+
+// mergeLocalManifestInto 在给定清单上就地重放 local manifest 的全部元素。
+func (p *Parser) mergeLocalManifestInto(main *Manifest, local *Manifest) error {
 	// 合并remotes
 	for _, remote := range local.Remotes {
 		exists := false
@@ -1869,68 +2715,248 @@ func (p *Parser) mergeLocalManifest(main *Manifest, local *Manifest) error {
 		}
 	}
 
-	// 合并projects（覆盖同名项目）
-	projectMap := make(map[string]int)
-	for i, proj := range main.Projects {
-		projectMap[proj.Name] = i
+	// local manifest 项目同样需要路径校验（防御手工构造的 Manifest 绕过 Parse）
+	if err := validateProjectTree(local.Projects); err != nil {
+		return err
 	}
 
+	// 按 local XML 顶层元素文档顺序重放 project/remove-project/extend-project。
+	// 这是关键语义：<remove-project name="foo"/><project name="foo" .../>
+	// 必须先移除旧定义再重新定义，而不是“先项目、再 remove、再 extend”。
+	if len(local.elementOrder) > 0 {
+		return p.replayLocalElements(main, local)
+	}
+
+	// 兜底（手工构造、无文档顺序信息）：保持旧的分阶段合并语义。
 	for _, proj := range local.Projects {
-		if idx, exists := projectMap[proj.Name]; exists {
-			// 覆盖现有项目
-			main.Projects[idx] = proj
-		} else {
-			// 添加新项目
-			main.Projects = append(main.Projects, proj)
-			projectMap[proj.Name] = len(main.Projects) - 1
-		}
+		applyLocalProject(main, proj)
 	}
-
-	// 处理remove-project
 	for _, rp := range local.RemoveProjects {
-		// 从主manifest中移除项目
-		for i := 0; i < len(main.Projects); i++ {
-			if main.Projects[i].Name == rp.Name {
-				main.Projects = append(main.Projects[:i], main.Projects[i+1:]...)
-				i--
-			}
+		matched, err := removeMatches(main, &main.Projects, rp, true)
+		if err != nil {
+			return err
+		}
+		if !matched && !rp.Optional.Get(false) {
+			return fmt.Errorf("local manifest remove-project specifies non-existent project: name=%q path=%q", rp.Name, rp.Path)
 		}
 	}
-	// remove-project 的删除会使 projectMap 中记录的下标失效（切片前移），
-	// 若沿用旧 map，extend-project 会修改错误的项目甚至越界 panic；
-	// 此处基于删除后的项目列表重建索引
-	projectMap = make(map[string]int)
-	for i, proj := range main.Projects {
-		projectMap[proj.Name] = i
-	}
-
-	// 应用extend-project
 	for _, extProj := range local.ExtendProjects {
-		if idx, exists := projectMap[extProj.Name]; exists {
-			proj := &main.Projects[idx]
-			// 增量更新
-			if extProj.Path != "" {
-				proj.Path = extProj.Path
+		matched, nameExists, err := applyExtendProjectToSlice(main, &main.Projects, extProj, true)
+		if err != nil {
+			return err
+		}
+		if !matched && !nameExists {
+			return fmt.Errorf("extend-project element specifies non-existent project: %s", extProj.Name)
+		}
+	}
+	return nil
+}
+
+// replayLocalElements 按 local manifest 的顶层元素顺序把 project/include/
+// remove-project/extend-project 应用到主清单。include 段内的项目与悬空
+// remove/extend 在其 include 位置执行。
+func (p *Parser) replayLocalElements(main, local *Manifest) error {
+	applyProject := func(proj Project) {
+		applyLocalProject(main, proj)
+	}
+	applyRemove := func(rp RemoveProject) error {
+		matched, err := removeMatches(main, &main.Projects, rp, true)
+		if err != nil {
+			return err
+		}
+		if matched {
+			return nil
+		}
+		if !rp.Optional.Get(false) {
+			return fmt.Errorf("local manifest remove-project specifies non-existent project: name=%q path=%q", rp.Name, rp.Path)
+		}
+		return nil
+	}
+	applyExtend := func(extProj ExtendProject) error {
+		matched, nameExists, err := applyExtendProjectToSlice(main, &main.Projects, extProj, true)
+		if err != nil {
+			return err
+		}
+		// name 存在但 path 无命中属于 no-op，不报告“项目不存在”。
+		if !matched && !nameExists {
+			return fmt.Errorf("extend-project element specifies non-existent project: %s", extProj.Name)
+		}
+		return nil
+	}
+
+	for _, elem := range local.elementOrder {
+		switch elem.kind {
+		case "project":
+			if elem.idx < len(local.Projects) {
+				applyProject(local.Projects[elem.idx])
 			}
-			if extProj.Groups != "" {
-				proj.Groups = extProj.Groups
+		case "include":
+			// fragment 模式下被 include 的清单保留了原始文档顺序，递归重放
+			// 可正确处理 include 内部的项目/remove/extend 交错顺序。
+			if elem.idx < len(local.Includes) && local.Includes[elem.idx].manifest != nil &&
+				local.Includes[elem.idx].manifest.parsedAsFragment &&
+				len(local.Includes[elem.idx].manifest.elementOrder) > 0 {
+				if err := p.replayLocalElements(main, local.Includes[elem.idx].manifest); err != nil {
+					return err
+				}
+				continue
 			}
-			if extProj.Revision != "" {
-				proj.Revision = extProj.Revision
+			// 兜底：按 include 段整体应用（非 fragment 模式解析的 local 清单）。
+			if elem.idx >= len(local.includeSegs) {
+				continue
 			}
-			if extProj.Remote != "" {
-				proj.Remote = extProj.Remote
+			seg := local.includeSegs[elem.idx]
+			if seg.start >= 0 && seg.start <= seg.end && seg.end <= len(local.Projects) {
+				for _, proj := range local.Projects[seg.start:seg.end] {
+					applyProject(proj)
+				}
 			}
-			if len(extProj.Copyfiles) > 0 {
-				proj.Copyfiles = append(proj.Copyfiles, extProj.Copyfiles...)
+			for _, rp := range seg.removes {
+				if err := applyRemove(rp); err != nil {
+					return err
+				}
 			}
-			if len(extProj.Linkfiles) > 0 {
-				proj.Linkfiles = append(proj.Linkfiles, extProj.Linkfiles...)
+			for _, extProj := range seg.extends {
+				if err := applyExtend(extProj); err != nil {
+					return err
+				}
+			}
+		case "remove-project":
+			if elem.idx < len(local.RemoveProjects) {
+				if err := applyRemove(local.RemoveProjects[elem.idx]); err != nil {
+					return err
+				}
+			}
+		case "extend-project":
+			if elem.idx < len(local.ExtendProjects) {
+				if err := applyExtend(local.ExtendProjects[elem.idx]); err != nil {
+					return err
+				}
 			}
 		}
 	}
-
 	return nil
+}
+
+// applyLocalProject 将 local manifest 中的项目（含嵌套子项目展平）应用到主清单：
+// 同名同有效 path 的项目用 local 的非空字段覆盖，否则追加。
+func applyLocalProject(main *Manifest, proj Project) {
+	for _, flatProj := range appendProjectWithChildren(nil, proj) {
+		idx := findProjectIndex(main.Projects, flatProj.Name, flatProj.Path)
+		if idx >= 0 {
+			overlayProjectValues(&main.Projects[idx], flatProj)
+			continue
+		}
+		main.Projects = append(main.Projects, flatProj)
+	}
+}
+
+// findProjectIndex 按 name + 有效 path 查找项目下标（未找到返回 -1）。
+func findProjectIndex(projects []Project, name, projectPath string) int {
+	key := localProjectKey(name, projectPath)
+	for i := range projects {
+		if localProjectKey(projects[i].Name, projects[i].Path) == key {
+			return i
+		}
+	}
+	return -1
+}
+
+// localProjectKey 生成 name + 有效 path 的唯一键（path 为空时按 name）。
+// 尾部 "/" 归一化，保证 foo 与 foo/ 命中同一项目。
+func localProjectKey(name, projectPath string) string {
+	name = normalizeManifestPath(name)
+	projectPath = normalizeManifestPath(projectPath)
+	if projectPath == "" {
+		projectPath = name
+	}
+	return name + "\x00" + projectPath
+}
+
+// overlayProjectValues 用 src 的非空/已声明字段覆盖 dst，保留 dst 中 src
+// 未声明的字段。用于 local manifest 对主清单项目的定制。
+func overlayProjectValues(dst *Project, src Project) {
+	if src.Path != "" {
+		dst.Path = src.Path
+	}
+	if src.Remote != "" {
+		dst.Remote = src.Remote
+	}
+	if src.Revision != "" {
+		dst.Revision = src.Revision
+	}
+	if src.Upstream != "" {
+		dst.Upstream = src.Upstream
+	}
+	if src.DestBranch != "" {
+		dst.DestBranch = src.DestBranch
+	}
+	if src.Groups != "" {
+		dst.Groups = src.Groups
+	}
+	if src.SyncC.Set {
+		dst.SyncC = src.SyncC
+	}
+	if src.SyncS.Set {
+		dst.SyncS = src.SyncS
+	}
+	if src.SyncTags.Set {
+		dst.SyncTags = src.SyncTags
+	}
+	if src.CloneDepth != 0 {
+		dst.CloneDepth = src.CloneDepth
+	}
+	if src.ForcePath.Set {
+		dst.ForcePath = src.ForcePath
+	}
+	if src.References != "" {
+		dst.References = src.References
+	}
+	if dst.CustomAttrs == nil {
+		dst.CustomAttrs = make(map[string]string)
+	}
+	for k, v := range src.CustomAttrs {
+		dst.CustomAttrs[k] = v
+	}
+	dst.Copyfiles = appendProjectCopyfiles(dst.Copyfiles, src.Copyfiles)
+	dst.Linkfiles = appendProjectLinkfiles(dst.Linkfiles, src.Linkfiles)
+	if len(src.Annotations) > 0 {
+		dst.Annotations = append(dst.Annotations, src.Annotations...)
+	}
+}
+
+// appendProjectCopyfiles 追加 copyfile（按 src+dest 去重）。
+func appendProjectCopyfiles(dst, src []Copyfile) []Copyfile {
+	for _, c := range src {
+		exists := false
+		for _, existing := range dst {
+			if existing.Src == c.Src && existing.Dest == c.Dest {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			dst = append(dst, c)
+		}
+	}
+	return dst
+}
+
+// appendProjectLinkfiles 追加 linkfile（按 src+dest 去重）。
+func appendProjectLinkfiles(dst, src []Linkfile) []Linkfile {
+	for _, l := range src {
+		exists := false
+		for _, existing := range dst {
+			if existing.Src == l.Src && existing.Dest == l.Dest {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			dst = append(dst, l)
+		}
+	}
+	return dst
 }
 
 // CreateRepoStructure 创建.repo目录结构
@@ -1961,23 +2987,6 @@ func (m *Manifest) CreateRepoStructure() error {
 	}
 
 	return nil
-}
-
-// GitRunner Config 结构体在这里定义，但实际的克隆逻辑在clone.go中实
-
-// GitRunner 接口定义
-type GitRunner interface {
-	Run(args ...string) ([]byte, error)
-}
-
-// Config 配置结构
-type Config struct {
-	ManifestURL    string
-	ManifestBranch string
-	ManifestName   string
-	Mirror         bool
-	Reference      string
-	Depth          int
 }
 
 // 以下是用于检查属性是否为标准属性的辅助函数
@@ -2012,7 +3021,7 @@ func isStandardRemoteAttr(name string) bool {
 
 func isStandardProjectAttr(name string) bool {
 	switch name {
-	case "name", "path", "remote", "revision", "upstream", "dest-branch", "groups", "sync-c", "sync-s", "sync-tags", "clone-depth", "references":
+	case "name", "path", "remote", "revision", "upstream", "dest-branch", "groups", "sync-c", "sync-s", "sync-tags", "clone-depth", "force-path", "references":
 		return true
 	}
 	return false
@@ -2036,7 +3045,7 @@ func isStandardLinkfileAttr(name string) bool {
 
 func isStandardRemoveProjectAttr(name string) bool {
 	switch name {
-	case "name", "path", "optional":
+	case "name", "path", "optional", "base-rev":
 		return true
 	}
 	return false
@@ -2119,11 +3128,11 @@ func (m *Manifest) ToXML() (string, error) {
 	if m.Default.SyncJ > 0 {
 		fmt.Fprintf(&b, ` sync-j="%d"`, m.Default.SyncJ)
 	}
-	if m.Default.SyncC {
-		b.WriteString(` sync-c="true"`)
+	if m.Default.SyncC.Set {
+		fmt.Fprintf(&b, ` sync-c="%t"`, m.Default.SyncC.Value)
 	}
-	if m.Default.SyncS {
-		b.WriteString(` sync-s="true"`)
+	if m.Default.SyncS.Set {
+		fmt.Fprintf(&b, ` sync-s="%t"`, m.Default.SyncS.Value)
 	}
 	// 上游 defaultToXml：仅最终值为 false 时输出（缺省 true 不输出）
 	if !m.Default.SyncTags.Get(true) {
@@ -2157,21 +3166,49 @@ func (m *Manifest) ToXML() (string, error) {
 		for _, k := range sortedKeys(r.CustomAttrs) {
 			b.WriteString(attr(k, r.CustomAttrs[k]))
 		}
+		if len(r.Annotations) > 0 {
+			b.WriteString(">\n")
+			writeAnnotations(&b, r.Annotations, "    ")
+			b.WriteString("  </remote>\n")
+		} else {
+			b.WriteString(" />\n")
+		}
+	}
+
+	// include 元素：保留 groups/revision 与自定义属性。仅输出尚未展开的
+	// include（手工构造的 Manifest）；解析器产生并展开 include 的清单中，
+	// 子清单项目已并入 Projects，再输出 include 会在二次解析时重复展开，
+	// 破坏 parse→ToXML→parse 的项目集合不变量。init/manifest 命令写扁平
+	// 清单时也会显式清空 Includes。
+	for _, inc := range m.Includes {
+		if inc.manifest != nil {
+			continue
+		}
+		b.WriteString("  <include")
+		b.WriteString(attr("name", inc.Name))
+		if inc.Groups != "" {
+			b.WriteString(attr("groups", inc.Groups))
+		}
+		if inc.Revision != "" {
+			b.WriteString(attr("revision", inc.Revision))
+		}
+		for _, k := range sortedKeys(inc.CustomAttrs) {
+			b.WriteString(attr(k, inc.CustomAttrs[k]))
+		}
 		b.WriteString(" />\n")
 	}
 
-	// 不输出 include 标签（init 合并后不需要）
-
 	// 添加项目
 	for _, p := range m.Projects {
-		b.WriteString("  <project")
-		b.WriteString(attr("name", p.Name))
-		// 始终包含 path 属性，如果为空则使用项目名称
-		if p.Path != "" {
-			b.WriteString(attr("path", p.Path))
-		} else {
-			b.WriteString(attr("path", p.Name))
+		projectName := normalizeManifestPath(p.Name)
+		projectPath := normalizeManifestPath(p.Path)
+		if projectPath == "" {
+			projectPath = projectName
 		}
+		b.WriteString("  <project")
+		b.WriteString(attr("name", projectName))
+		// 始终包含 path 属性，如果为空则使用项目名称
+		b.WriteString(attr("path", projectPath))
 		if p.Remote != "" {
 			b.WriteString(attr("remote", p.Remote))
 		}
@@ -2187,14 +3224,20 @@ func (m *Manifest) ToXML() (string, error) {
 		if p.Groups != "" {
 			b.WriteString(attr("groups", p.Groups))
 		}
-		if p.SyncC {
-			b.WriteString(` sync-c="true"`)
+		if p.SyncC.Set {
+			fmt.Fprintf(&b, ` sync-c="%t"`, p.SyncC.Value)
 		}
-		if p.SyncS {
-			b.WriteString(` sync-s="true"`)
+		if p.SyncS.Set {
+			fmt.Fprintf(&b, ` sync-s="%t"`, p.SyncS.Value)
 		}
 		if p.CloneDepth > 0 {
 			fmt.Fprintf(&b, ` clone-depth="%d"`, p.CloneDepth)
+		}
+		if p.ForcePath.Set {
+			fmt.Fprintf(&b, ` force-path="%t"`, p.ForcePath.Value)
+		}
+		if p.References != "" {
+			b.WriteString(attr("references", p.References))
 		}
 		// 添加项目的自定义属性，但排除以 "__" 开头的内部属性
 		for _, k := range sortedKeys(p.CustomAttrs) {
@@ -2207,8 +3250,8 @@ func (m *Manifest) ToXML() (string, error) {
 		if !p.SyncTags.Get(true) {
 			b.WriteString(` sync-tags="false"`)
 		}
-		// 检查是否有 copyfile 或 linkfile 子元素
-		if len(p.Copyfiles) > 0 || len(p.Linkfiles) > 0 {
+		// 检查是否有 copyfile/linkfile/annotation 子元素
+		if len(p.Copyfiles) > 0 || len(p.Linkfiles) > 0 || len(p.Annotations) > 0 {
 			// 开标签闭合后才能写子元素（否则输出非法 XML）
 			b.WriteString(">\n")
 			for _, c := range p.Copyfiles {
@@ -2231,24 +3274,118 @@ func (m *Manifest) ToXML() (string, error) {
 				b.WriteString(" />\n")
 			}
 
+			writeAnnotations(&b, p.Annotations, "    ")
+
 			b.WriteString("  </project>\n")
 		} else {
 			b.WriteString(" />\n")
 		}
 	}
 
-	// 添加移除项目
+	// 添加 extend-project（保留 groups/revision/dest-* 等扩展字段）。
+	// 写盘前过滤悬空条目：目标项目不存在时写回会生成下次解析直接失败的
+	// 清单（上游 fail-fast），因此这类 extend 不落盘。
+	projectNames := make(map[string]bool, len(m.Projects))
+	for i := range m.Projects {
+		projectNames[normalizeManifestPath(m.Projects[i].Name)] = true
+	}
+	for _, ext := range m.ExtendProjects {
+		if !projectNames[normalizeManifestPath(ext.Name)] {
+			continue
+		}
+		b.WriteString("  <extend-project")
+		b.WriteString(attr("name", ext.Name))
+		if ext.Path != "" {
+			b.WriteString(attr("path", normalizeManifestPath(ext.Path)))
+		}
+		if ext.DestPath != "" {
+			b.WriteString(attr("dest-path", normalizeManifestPath(ext.DestPath)))
+		}
+		if ext.Groups != "" {
+			b.WriteString(attr("groups", ext.Groups))
+		}
+		if ext.Revision != "" {
+			b.WriteString(attr("revision", ext.Revision))
+		}
+		if ext.BaseRev != "" {
+			b.WriteString(attr("base-rev", ext.BaseRev))
+		}
+		if ext.Remote != "" {
+			b.WriteString(attr("remote", ext.Remote))
+		}
+		if ext.DestBranch != "" {
+			b.WriteString(attr("dest-branch", ext.DestBranch))
+		}
+		if ext.Upstream != "" {
+			b.WriteString(attr("upstream", ext.Upstream))
+		}
+		if len(ext.Copyfiles) > 0 || len(ext.Linkfiles) > 0 {
+			b.WriteString(">\n")
+			for _, c := range ext.Copyfiles {
+				b.WriteString("    <copyfile")
+				b.WriteString(attr("src", c.Src))
+				b.WriteString(attr("dest", c.Dest))
+				for _, k := range sortedKeys(c.CustomAttrs) {
+					b.WriteString(attr(k, c.CustomAttrs[k]))
+				}
+				b.WriteString(" />\n")
+			}
+			for _, l := range ext.Linkfiles {
+				b.WriteString("    <linkfile")
+				b.WriteString(attr("src", l.Src))
+				b.WriteString(attr("dest", l.Dest))
+				for _, k := range sortedKeys(l.CustomAttrs) {
+					b.WriteString(attr(k, l.CustomAttrs[k]))
+				}
+				b.WriteString(" />\n")
+			}
+			b.WriteString("  </extend-project>\n")
+		} else {
+			b.WriteString(" />\n")
+		}
+	}
+
+	// 添加移除项目。写盘顺序是“项目在前、remove 在后”，因此任何仍能命中
+	// 当前项目的 remove 都会在二次解析时生效、改变项目集合；这类残留条目
+	// 不得输出（已消费的 remove 在解析期已从列表移除）。不命中的 optional
+	// 悬空条目保留，输出后二次解析仍是无操作。
 	for _, r := range m.RemoveProjects {
+		if removeProjectMatchesProjects(m.Projects, r) {
+			continue
+		}
 		b.WriteString("  <remove-project")
 		b.WriteString(attr("name", r.Name))
 		if r.Path != "" {
-			b.WriteString(attr("path", r.Path))
+			b.WriteString(attr("path", normalizeManifestPath(r.Path)))
 		}
-		if r.Optional {
+		if r.Optional.Get(false) {
 			b.WriteString(` optional="true"`)
+		}
+		if r.BaseRev != "" {
+			b.WriteString(attr("base-rev", r.BaseRev))
 		}
 		for _, k := range sortedKeys(r.CustomAttrs) {
 			b.WriteString(attr(k, r.CustomAttrs[k]))
+		}
+		b.WriteString(" />\n")
+	}
+
+	// 添加 repo-hooks（如果存在）
+	if m.RepoHooks != nil {
+		b.WriteString("  <repo-hooks")
+		b.WriteString(attr("in-project", m.RepoHooks.InProject))
+		if m.RepoHooks.EnabledList != "" {
+			b.WriteString(attr("enabled-list", m.RepoHooks.EnabledList))
+		}
+		b.WriteString(" />\n")
+	}
+
+	// 添加 manifest-server（如果存在）
+	if m.ManifestServer != nil {
+		b.WriteString("  <manifest-server")
+		b.WriteString(attr("url", m.ManifestServer.URL))
+		if m.ManifestServer.Helper != "" {
+			b.WriteString(attr("helper", m.ManifestServer.Helper))
 		}
 		b.WriteString(" />\n")
 	}
@@ -2270,6 +3407,24 @@ func (m *Manifest) ToXML() (string, error) {
 	b.WriteString("</manifest>\n")
 
 	return b.String(), nil
+}
+
+// writeAnnotations 输出 annotation 子元素。Keep 显式为 "false" 的注解不落盘
+// （上游 ProjectToXml 仅输出 keep=="true" 的注解；缺省视为保留）。
+func writeAnnotations(b *strings.Builder, annotations []Annotation, indent string) {
+	for _, a := range annotations {
+		if a.Keep == "false" {
+			continue
+		}
+		b.WriteString(indent)
+		b.WriteString("<annotation")
+		b.WriteString(attr("name", a.Name))
+		b.WriteString(attr("value", a.Value))
+		if a.Keep != "" && a.Keep != "true" {
+			b.WriteString(attr("keep", a.Keep))
+		}
+		b.WriteString(" />\n")
+	}
 }
 
 // escapeXMLAttr 对 XML 属性值进行转义，保证产出的 manifest 为合法 XML。

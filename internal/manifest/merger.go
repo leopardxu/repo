@@ -46,125 +46,283 @@ func (m *Merger) Merge(manifests []*Manifest) (*Manifest, error) {
 	return result, nil
 }
 
-// mergeManifest 将src清单合并到dst清单
+// mergeManifest 将 src 清单合并到 dst 清单。合并语义：
+//   - remote/default/项目只补空或追加，不覆盖 dst 已有的非空字段；
+//   - remove-project 使用 path 匹配语义；optional 条目仅表示“目标缺失可接受”，
+//     不得作为后续清单项目的过滤条件，也不向外传播；
+//   - 非 optional 的 remove 未命中时追加到 dst 供外层执行。
 func (m *Merger) mergeManifest(dst, src *Manifest) error {
 	if dst == nil || src == nil {
 		return fmt.Errorf("源清单或目标清单为空")
 	}
 
-	// 合并远程
-	remoteCount := 0
+	// 合并远程（同名 remote 只补空字段，不覆盖）
 	for _, remote := range src.Remotes {
-		// 检查是否已存在同名远程
-		exists := false
-		for _, r := range dst.Remotes {
-			if r.Name == remote.Name {
-				exists = true
+		idx := -1
+		for i := range dst.Remotes {
+			if dst.Remotes[i].Name == remote.Name {
+				idx = i
 				break
 			}
 		}
-
-		// 如果不存在，添加到目标清单
-		if !exists {
+		if idx < 0 {
 			dst.Remotes = append(dst.Remotes, remote)
-			remoteCount++
+			continue
 		}
+		mergeRemoteValues(&dst.Remotes[idx], remote)
 	}
 
-	// 远程配置合并完成
+	// 合并 default（只补空）
+	mergeDefaultValues(&dst.Default, src.Default)
 
-	// 合并项目
+	// 合并项目（相同 name+path 只补空，不覆盖）
 	addedProjects := 0
 	updatedProjects := 0
 	skippedProjects := 0
 
 	for _, project := range src.Projects {
-		// 检查是否需要移除该项目
+		// 检查是否需要移除该项目（沿用 remove-project 的 path 语义）。
+		// optional 的悬空 remove 仅表示“目标缺失可接受”，不得作为后续
+		// 清单的过滤条件；仅非 optional 的 remove 参与过滤。
 		skip := false
 		for _, rp := range dst.RemoveProjects {
-			if rp.Name == project.Name {
+			if rp.Optional.Get(false) {
+				continue
+			}
+			if removeProjectMatchesProject(rp, project) {
 				skip = true
-				// 跳过已标记为移除的项目
 				break
 			}
 		}
-
 		if skip {
 			skippedProjects++
 			continue
 		}
 
-		// 使用 name + path 组合作为唯一标识，支持同一仓库拉取到不同目录
-		exists := false
-		projectPath := project.Path
+		projectPath := normalizeManifestPath(project.Path)
 		if projectPath == "" {
-			projectPath = project.Name // 如果 path 为空，使用 name 作为 path
+			projectPath = normalizeManifestPath(project.Name)
 		}
 
-		for i, p := range dst.Projects {
-			dstPath := p.Path
+		exists := false
+		for i := range dst.Projects {
+			dstPath := normalizeManifestPath(dst.Projects[i].Path)
 			if dstPath == "" {
-				dstPath = p.Name
+				dstPath = normalizeManifestPath(dst.Projects[i].Name)
 			}
-
-			// 比较 name 和 path 的组合
-			if p.Name == project.Name && dstPath == projectPath {
-				// 更新现有项目（相同 name 和 path）
-				logger.Debug("合并: 更新项目 name=%s, path=%s", project.Name, projectPath)
-				dst.Projects[i] = project
+			if normalizeManifestPath(dst.Projects[i].Name) == normalizeManifestPath(project.Name) && dstPath == projectPath {
+				mergeProjectValues(&dst.Projects[i], project)
 				exists = true
 				updatedProjects++
 				break
 			}
 		}
-
-		// 如果不存在，添加到目标清单（支持同名不同路径）
 		if !exists {
-			logger.Debug("合并: 添加新项目 name=%s, path=%s", project.Name, projectPath)
 			dst.Projects = append(dst.Projects, project)
 			addedProjects++
 		}
 	}
 
-	// 项目合并完成
 	logger.Info("合并项目统计: 添加=%d, 更新=%d, 跳过=%d", addedProjects, updatedProjects, skippedProjects)
 
 	// 合并移除项目
-	removedCount := 0
-	addedRemoveProjects := 0
-
 	for _, removeProject := range src.RemoveProjects {
-		// 检查是否已存在同名移除项目
+		// 先尝试在目标项目上执行（path/optional 语义与解析期一致）
+		matched, err := removeMatches(dst, &dst.Projects, removeProject, true)
+		if err != nil {
+			return err
+		}
+		if matched {
+			// 已在本层生效：不再保留该条目。否则后续清单合并会把它当成
+			// 仍待执行的 remove 而误跳过项目；ToXML 写回不存在的
+			// remove-project 也会导致回环解析失败。
+			continue
+		}
+
+		// 未命中：仅非 optional 条目保留供更外层执行（按 name+path 去重）。
+		// optional 未命中表示目标缺失可接受，既不作为过滤条件，也不传播。
+		if removeProject.Optional.Get(false) {
+			continue
+		}
 		exists := false
 		for _, rp := range dst.RemoveProjects {
-			if rp.Name == removeProject.Name {
+			if rp.Name == removeProject.Name && rp.Path == removeProject.Path {
 				exists = true
 				break
 			}
 		}
-
-		// 如果不存在，添加到目标清
 		if !exists {
 			dst.RemoveProjects = append(dst.RemoveProjects, removeProject)
-			addedRemoveProjects++
-			// 添加移除项目标记
-		}
-
-		// 从项目列表中移除该项（注意：remove-project 仅根据 name 匹配，不考虑 path）
-		for i := 0; i < len(dst.Projects); i++ {
-			if dst.Projects[i].Name == removeProject.Name {
-				// 移除项目
-				dst.Projects = append(dst.Projects[:i], dst.Projects[i+1:]...)
-				removedCount++
-				i-- // 调整索引，因为删除了元素
-				// 继续检查，因为可能有多个同名不同 path 的项目
-			}
 		}
 	}
 
-	// 移除项目处理完成
+	// 合并其余元数据
+	if dst.Notice == "" {
+		dst.Notice = src.Notice
+	}
+	if dst.RepoHooks == nil && src.RepoHooks != nil {
+		hooks := *src.RepoHooks
+		dst.RepoHooks = &hooks
+	}
+	if dst.ManifestServer == nil && src.ManifestServer != nil {
+		server := *src.ManifestServer
+		dst.ManifestServer = &server
+	}
+	if dst.Superproject == nil && src.Superproject != nil {
+		superproject := *src.Superproject
+		dst.Superproject = &superproject
+	}
+	if dst.CustomAttrs == nil {
+		dst.CustomAttrs = make(map[string]string)
+	}
+	for k, v := range src.CustomAttrs {
+		if _, ok := dst.CustomAttrs[k]; !ok {
+			dst.CustomAttrs[k] = v
+		}
+	}
 
 	return nil
+}
+
+// removeProjectMatchesProject 判断 remove-project 是否匹配项目（path 为空时
+// 项目 Path 按 Name 视为隐式 path）。
+func removeProjectMatchesProject(rp RemoveProject, proj Project) bool {
+	rpName := normalizeManifestPath(rp.Name)
+	rpPath := normalizeManifestPath(rp.Path)
+	if rpName == "" && rpPath == "" {
+		return false
+	}
+	projName := normalizeManifestPath(proj.Name)
+	if rpPath == "" {
+		return projName == rpName
+	}
+	projectPath := normalizeManifestPath(proj.Path)
+	if projectPath == "" {
+		projectPath = projName
+	}
+	return projectPath == rpPath && (rpName == "" || projName == rpName)
+}
+
+// mergeRemoteValues 用 src 补齐 dst 的空字段，不覆盖已有值。
+func mergeRemoteValues(dst *Remote, src Remote) {
+	if dst.Fetch == "" {
+		dst.Fetch = src.Fetch
+	}
+	if dst.Review == "" {
+		dst.Review = src.Review
+	}
+	if dst.Revision == "" {
+		dst.Revision = src.Revision
+	}
+	if dst.Alias == "" {
+		dst.Alias = src.Alias
+	}
+	if dst.PushURL == "" {
+		dst.PushURL = src.PushURL
+	}
+	if dst.CustomAttrs == nil {
+		dst.CustomAttrs = make(map[string]string)
+	}
+	for k, v := range src.CustomAttrs {
+		if _, ok := dst.CustomAttrs[k]; !ok {
+			dst.CustomAttrs[k] = v
+		}
+	}
+	if len(src.Annotations) > 0 {
+		dst.Annotations = append(dst.Annotations, src.Annotations...)
+	}
+}
+
+// mergeDefaultValues 用 src 补齐 dst 的空字段，不覆盖已有值。
+func mergeDefaultValues(dst *Default, src Default) {
+	if dst.Remote == "" {
+		dst.Remote = src.Remote
+	}
+	if dst.Revision == "" {
+		dst.Revision = src.Revision
+	}
+	if dst.DestBranch == "" {
+		dst.DestBranch = src.DestBranch
+	}
+	if dst.Upstream == "" {
+		dst.Upstream = src.Upstream
+	}
+	if dst.SyncJ == 0 {
+		dst.SyncJ = src.SyncJ
+	}
+	if !dst.SyncC.Set {
+		dst.SyncC = src.SyncC
+	}
+	if !dst.SyncS.Set {
+		dst.SyncS = src.SyncS
+	}
+	if !dst.SyncTags.Set {
+		dst.SyncTags = src.SyncTags
+	}
+	if dst.Sync == "" {
+		dst.Sync = src.Sync
+	}
+	if dst.CustomAttrs == nil {
+		dst.CustomAttrs = make(map[string]string)
+	}
+	for k, v := range src.CustomAttrs {
+		if _, ok := dst.CustomAttrs[k]; !ok {
+			dst.CustomAttrs[k] = v
+		}
+	}
+}
+
+// mergeProjectValues 用 src 补齐 dst 的空字段并追加列表，不覆盖非空字段。
+func mergeProjectValues(dst *Project, src Project) {
+	if dst.Path == "" {
+		dst.Path = src.Path
+	}
+	if dst.Remote == "" {
+		dst.Remote = src.Remote
+	}
+	if dst.Revision == "" {
+		dst.Revision = src.Revision
+	}
+	if dst.Upstream == "" {
+		dst.Upstream = src.Upstream
+	}
+	if dst.DestBranch == "" {
+		dst.DestBranch = src.DestBranch
+	}
+	if dst.Groups == "" {
+		dst.Groups = src.Groups
+	}
+	if !dst.SyncC.Set {
+		dst.SyncC = src.SyncC
+	}
+	if !dst.SyncS.Set {
+		dst.SyncS = src.SyncS
+	}
+	if !dst.SyncTags.Set {
+		dst.SyncTags = src.SyncTags
+	}
+	if dst.CloneDepth == 0 {
+		dst.CloneDepth = src.CloneDepth
+	}
+	if !dst.ForcePath.Set {
+		dst.ForcePath = src.ForcePath
+	}
+	if dst.References == "" {
+		dst.References = src.References
+	}
+	if dst.CustomAttrs == nil {
+		dst.CustomAttrs = make(map[string]string)
+	}
+	for k, v := range src.CustomAttrs {
+		if _, ok := dst.CustomAttrs[k]; !ok {
+			dst.CustomAttrs[k] = v
+		}
+	}
+	dst.Copyfiles = appendProjectCopyfiles(dst.Copyfiles, src.Copyfiles)
+	dst.Linkfiles = appendProjectLinkfiles(dst.Linkfiles, src.Linkfiles)
+	if len(src.Annotations) > 0 {
+		dst.Annotations = append(dst.Annotations, src.Annotations...)
+	}
 }
 
 // ProcessIncludes 处理清单中的include标签
@@ -195,21 +353,20 @@ func (m *Merger) ProcessIncludes(manifest *Manifest, groups []string) (*Manifest
 
 		// 使用组过滤
 
-		// 解析包含的清单文
-		includeManifest, err := m.Parser.ParseFromFile(includePath, groups)
+		// 解析包含的清单文件。以子清单上下文解析：其中悬空的 remove-project
+		// 目标可能在外层清单，不应在单独解析时硬报错；组过滤统一由调用方
+		// 在完整清单上执行，故此处传 nil。
+		m.Parser.includeDepth++
+		includeManifest, err := m.Parser.ParseFromFile(includePath, nil)
+		m.Parser.includeDepth--
 		if err != nil {
 			logger.Error("failed to parse included manifest失 %s, 错误: %v", includePath, err)
 			return nil, fmt.Errorf("failed to parse included manifest失 %w", err)
 		}
 
-		// 递归处理包含的清单中的include标签
-		processedInclude, err := m.ProcessIncludes(includeManifest, groups)
-		if err != nil {
-			logger.Error("处理包含的清单中的包含标签failed: %v", err)
-			return nil, err
-		}
-
-		manifests = append(manifests, processedInclude)
+		// ParseFromFile 已递归展开 include 并合并其项目，无需再次递归处理，
+		// 避免同一清单被重复解析/合并。
+		manifests = append(manifests, includeManifest)
 	}
 
 	// 合并所有清单

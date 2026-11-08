@@ -14,8 +14,7 @@ import (
 func SmartSyncCmd() *cobra.Command {
 	// 创建 sync 命令的选项
 	opts := &SyncOptions{
-		Jobs:         runtime.NumCPU() * 2,
-		RetryFetches: 3,
+		Jobs: runtime.NumCPU() * 2,
 	}
 
 	cmd := &cobra.Command{

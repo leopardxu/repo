@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestConfigValidate(t *testing.T) {
@@ -144,6 +145,11 @@ func TestExtractBaseURLFromManifestURL(t *testing.T) {
 		want string
 	}{
 		{
+			name: "HTTPS URL with userinfo",
+			url:  "https://user@example.com/path/to/manifest.git",
+			want: "https://user@example.com",
+		},
+		{
 			name: "SSH URL",
 			url:  "ssh://git@example.com/path/to/manifest.git",
 			want: "ssh://git@example.com",
@@ -194,6 +200,28 @@ func TestGetDefaultGroups(t *testing.T) {
 	}
 }
 
+func TestEffectiveGroups(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    *Config
+		groups string
+		want   string
+	}{
+		{name: "empty groups fall back to default", cfg: &Config{}, want: "default"},
+		{name: "whitespace groups fall back to default", cfg: &Config{Groups: "  "}, want: "default"},
+		{name: "explicit groups kept verbatim", cfg: &Config{Groups: "linux,arm"}, want: "linux,arm"},
+		{name: "single group kept", cfg: &Config{Groups: "default"}, want: "default"},
+		{name: "nil config falls back to default", cfg: nil, want: "default"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.EffectiveGroups(); got != tt.want {
+				t.Errorf("EffectiveGroups() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsCurrentBranchMode(t *testing.T) {
 	cfg := Config{CurrentBranch: true, NoCurrentBranch: false}
 	if !cfg.IsCurrentBranchMode() {
@@ -219,20 +247,31 @@ func TestIsTagsEnabled(t *testing.T) {
 }
 
 func TestIsColorEnabled(t *testing.T) {
-	tests := []struct {
-		color string
-		want  bool
-	}{
-		{"never", false},
-		{"always", true},
-		{"auto", true},
-		{"", true},
+	// always/never 与终端无关
+	if cfg := (Config{Color: "never"}); cfg.IsColorEnabled() {
+		t.Error("Color=never should disable color")
+	}
+	if cfg := (Config{Color: "always"}); !cfg.IsColorEnabled() {
+		t.Error("Color=always should enable color")
 	}
 
-	for _, tt := range tests {
-		cfg := Config{Color: tt.color}
-		if got := cfg.IsColorEnabled(); got != tt.want {
-			t.Errorf("IsColorEnabled() with Color=%q = %v, want %v", tt.color, got, tt.want)
+	// auto/空值仅在 stdout 是终端时启用。把 stdout 重定向到普通文件模拟
+	// 重定向/CI 场景，必须返回 false。
+	origStdout := os.Stdout
+	f, err := os.CreateTemp(t.TempDir(), "stdout")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer func() {
+		os.Stdout = origStdout
+		f.Close()
+	}()
+	os.Stdout = f
+
+	for _, color := range []string{"auto", ""} {
+		cfg := Config{Color: color}
+		if cfg.IsColorEnabled() {
+			t.Errorf("IsColorEnabled() with Color=%q and redirected stdout = true, want false", color)
 		}
 	}
 }
@@ -421,5 +460,288 @@ func TestMigrateConfig(t *testing.T) {
 	cfg3 := &Config{Version: 999}
 	if err := migrateConfig(cfg3); err == nil {
 		t.Error("migrateConfig with unsupported version should return error")
+	}
+}
+
+// TestResolveRelativeURL 覆盖 urljoin 语义：无 base 返回空串（不得把相对值
+// 当完整地址）；普通相对 fetch（含不带点号的 "platform"）与 "."/".." 均按
+// base 解析；scp 规范化；文件路径语义；已完整地址原样返回。
+func TestResolveRelativeURLNoBase(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		rel  string
+		want string
+	}{
+		{name: "no base returns empty", cfg: Config{}, rel: "../foo", want: ""},
+		{name: "no base dotdot returns empty", cfg: Config{}, rel: "..", want: ""},
+		{name: "no base dot returns empty", cfg: Config{}, rel: ".", want: ""},
+		{name: "no base relative path returns empty", cfg: Config{}, rel: "foo/bar", want: ""},
+		{
+			name: "manifest url join",
+			cfg:  Config{ManifestURL: "https://example.com/a/manifest"},
+			rel:  "../foo",
+			want: "https://example.com/foo",
+		},
+		{
+			name: "dotless relative fetch is urljoined",
+			cfg:  Config{ManifestURL: "https://example.com/a/manifest"},
+			rel:  "platform",
+			want: "https://example.com/a/platform",
+		},
+		{
+			name: "dotless nested relative fetch is urljoined",
+			cfg:  Config{ManifestURL: "ssh://git@example.com/base/manifest.git"},
+			rel:  "platform/build",
+			want: "ssh://git@example.com/base/platform/build",
+		},
+		{
+			name: "absolute url is returned unchanged",
+			cfg:  Config{ManifestURL: "https://example.com/a/manifest"},
+			rel:  "ssh://git@other.example.com/base",
+			want: "ssh://git@other.example.com/base",
+		},
+		{
+			name: "scp style url is returned unchanged",
+			cfg:  Config{ManifestURL: "https://example.com/a/manifest"},
+			rel:  "git@other.example.com:base",
+			want: "git@other.example.com:base",
+		},
+		{
+			name: "scp style url without user is returned unchanged",
+			cfg:  Config{ManifestURL: "/srv/git/manifests/default.xml"},
+			rel:  "other.example.com:base",
+			want: "other.example.com:base",
+		},
+		{
+			name: "scheme url with file base is returned unchanged",
+			cfg:  Config{ManifestURL: "/srv/git/manifests/default.xml"},
+			rel:  "ssh://other.example.com/base",
+			want: "ssh://other.example.com/base",
+		},
+		{
+			name: "scp style base without user normalized to ssh",
+			cfg:  Config{ManifestURL: "example.com:base/manifest"},
+			rel:  "../foo",
+			want: "ssh://example.com/foo",
+		},
+		{
+			name: "absolute file path is returned unchanged",
+			cfg:  Config{ManifestURL: "/srv/git/manifests/default.xml"},
+			rel:  "/srv/git/other",
+			want: "/srv/git/other",
+		},
+		{
+			name: "manifest url join dot",
+			cfg:  Config{ManifestURL: "https://example.com/a/manifest"},
+			rel:  ".",
+			want: "https://example.com/a/",
+		},
+		{
+			name: "manifest url join dot slash",
+			cfg:  Config{ManifestURL: "https://example.com/a/manifest"},
+			rel:  "./x",
+			want: "https://example.com/a/x",
+		},
+		{
+			name: "manifest url join dotdot",
+			cfg:  Config{ManifestURL: "https://example.com/a/b/manifest"},
+			rel:  "..",
+			want: "https://example.com/a/",
+		},
+		{
+			name: "default remote url join",
+			cfg:  Config{DefaultRemoteURL: "ssh://git@example.com/base/manifest"},
+			rel:  "../foo",
+			want: "ssh://git@example.com/foo",
+		},
+		{
+			name: "scp style base normalized to ssh",
+			cfg:  Config{ManifestURL: "git@example.com:base/manifest"},
+			rel:  "../foo",
+			want: "ssh://git@example.com/foo",
+		},
+		{
+			name: "absolute file path uses filepath semantics",
+			cfg:  Config{ManifestURL: "/srv/git/manifests/default.xml"},
+			rel:  "../platform",
+			want: "/srv/git/platform",
+		},
+		{
+			name: "absolute file path dot",
+			cfg:  Config{ManifestURL: "/srv/git/manifests/default.xml"},
+			rel:  ".",
+			want: "/srv/git/manifests",
+		},
+		{
+			name: "relative file base unresolved",
+			cfg:  Config{ManifestURL: "relative/manifests/default.xml"},
+			rel:  "../foo",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.ResolveRelativeURL(tt.rel); got != tt.want {
+				t.Errorf("ResolveRelativeURL(%q) = %q, want %q", tt.rel, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractBaseURLHTTPSUserinfo 回归：https://user@host/... 必须先按
+// http(s) 解析，返回 scheme://user@host，而不是被 scp 分支截成 "https"。
+func TestExtractBaseURLHTTPSUserinfo(t *testing.T) {
+	cfg := &Config{}
+	got := cfg.ExtractBaseURLFromManifestURL("https://user@example.com/path/to/manifest.git")
+	if want := "https://user@example.com"; got != want {
+		t.Errorf("ExtractBaseURLFromManifestURL() = %q, want %q", got, want)
+	}
+}
+
+// resetConfigCache 清空包级缓存，保证缓存相关测试互不干扰。
+func resetConfigCache() {
+	configMutex.Lock()
+	configCache = nil
+	configCachePath = ""
+	configLastModTime = time.Time{}
+	configMutex.Unlock()
+}
+
+// writeRepoConfig 在 root/.repo/config.json 写入最小可加载配置。
+func writeRepoConfig(t *testing.T, root, manifestURL string) string {
+	t.Helper()
+	repoDir := filepath.Join(root, ".repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir .repo: %v", err)
+	}
+	configPath := filepath.Join(repoDir, "config.json")
+	data := []byte(`{"version":1,"manifest_url":"` + manifestURL + `","manifest_name":"default.xml"}`)
+	if err := os.WriteFile(configPath, data, 0o644); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+	return configPath
+}
+
+// TestConfigCacheKeyedByPath 回归：缓存 key 必须包含配置文件路径/RepoRoot，
+// 在不同 repo 根目录之间不能复用旧配置；命中也返回副本。
+func TestConfigCacheKeyedByPath(t *testing.T) {
+	resetConfigCache()
+	defer resetConfigCache()
+
+	root1 := t.TempDir()
+	root2 := t.TempDir()
+	writeRepoConfig(t, root1, "https://one.example.com/manifest.git")
+	writeRepoConfig(t, root2, "https://two.example.com/manifest.git")
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+
+	if err := os.Chdir(root1); err != nil {
+		t.Fatalf("chdir root1: %v", err)
+	}
+	cfg1, err := Load()
+	if err != nil {
+		t.Fatalf("Load root1: %v", err)
+	}
+	if cfg1.ManifestURL != "https://one.example.com/manifest.git" {
+		t.Fatalf("root1 ManifestURL = %q", cfg1.ManifestURL)
+	}
+
+	// 修改 Load 返回的副本后再次 Load（同一路径应命中缓存），缓存不能被污染
+	cfg1.ManifestURL = "mutated"
+	cfg1Hit, err := Load()
+	if err != nil {
+		t.Fatalf("Load root1 (cache hit): %v", err)
+	}
+	if cfg1Hit.ManifestURL != "https://one.example.com/manifest.git" {
+		t.Errorf("cached copy leaked mutation: ManifestURL = %q", cfg1Hit.ManifestURL)
+	}
+
+	if err := os.Chdir(root2); err != nil {
+		t.Fatalf("chdir root2: %v", err)
+	}
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatalf("Load root2: %v", err)
+	}
+	if cfg2.ManifestURL != "https://two.example.com/manifest.git" {
+		t.Errorf("root2 ManifestURL = %q, want config from root2 (cache must be path-keyed)", cfg2.ManifestURL)
+	}
+
+	// 回到 root1 仍应得到 root1 的配置，不能被 root2 的缓存干扰
+	if err := os.Chdir(root1); err != nil {
+		t.Fatalf("chdir root1 again: %v", err)
+	}
+	cfg1b, err := Load()
+	if err != nil {
+		t.Fatalf("Load root1 again: %v", err)
+	}
+	if cfg1b.ManifestURL != "https://one.example.com/manifest.git" {
+		t.Errorf("root1 ManifestURL after root2 load = %q, want root1 config", cfg1b.ManifestURL)
+	}
+}
+
+// TestConfigCacheInvalidatesOnMtimeChange 回归：mtime 不同即失效（旧实现用
+// !After，会把时间回退误判为仍有效而返回过期内容）。
+func TestConfigCacheInvalidatesOnMtimeChange(t *testing.T) {
+	resetConfigCache()
+	defer resetConfigCache()
+
+	root := t.TempDir()
+	configPath := writeRepoConfig(t, root, "https://old.example.com/manifest.git")
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ManifestURL != "https://old.example.com/manifest.git" {
+		t.Fatalf("initial ManifestURL = %q", cfg.ManifestURL)
+	}
+
+	// 重写为不同的内容，并把 mtime 调早（旧缓存 mtime 更晚）
+	data := []byte(`{"version":1,"manifest_url":"https://new.example.com/manifest.git","manifest_name":"default.xml"}`)
+	if err := os.WriteFile(configPath, data, 0o644); err != nil {
+		t.Fatalf("rewrite config.json: %v", err)
+	}
+	older := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(configPath, older, older); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	cfg2, err := Load()
+	if err != nil {
+		t.Fatalf("Load after rewrite: %v", err)
+	}
+	if cfg2.ManifestURL != "https://new.example.com/manifest.git" {
+		t.Errorf("ManifestURL = %q, stale cache used (mtime decrease must invalidate)", cfg2.ManifestURL)
+	}
+}
+
+// TestGetRemoteURLUsesDiscoveredRepoRoot 回归：从子目录执行时 GetRemoteURL
+// 必须用已发现的 repoRoot 读取 .repo/config.json，而不是依赖 CWD。
+func TestGetRemoteURLUsesDiscoveredRepoRoot(t *testing.T) {
+	root := t.TempDir()
+	writeRepoConfig(t, root, "https://git.example.com/manifests/manifest.git")
+
+	subDir := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	if err := os.Chdir(subDir); err != nil {
+		t.Fatalf("chdir subdir: %v", err)
+	}
+
+	cfg := &Config{}
+	if got, want := cfg.GetRemoteURL(), "https://git.example.com"; got != want {
+		t.Errorf("GetRemoteURL() = %q, want %q (must find .repo/config.json from subdir)", got, want)
 	}
 }
