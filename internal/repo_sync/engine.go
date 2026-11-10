@@ -43,12 +43,14 @@ func (e *SyncError) Error() string {
 		retryInfo = fmt.Sprintf(" (重试次数: %d)", e.RetryCount)
 	}
 
-	if e.Output != "" {
-		return fmt.Sprintf("[%s] %s 在%s 阶段failed%s: %v\n%s",
-			timeStr, e.ProjectName, e.Phase, retryInfo, e.Err, e.Output)
-	}
-	return fmt.Sprintf("[%s] %s 在%s 阶段failed%s: %v",
+	msg := fmt.Sprintf("[%s] %s 在%s 阶段失败%s: %v",
 		timeStr, e.ProjectName, e.Phase, retryInfo, e.Err)
+	// GitCommandError.Error() 已携带 git 的 stderr/stdout；Output 通常与之相同，
+	// 仅在错误文本尚未包含时才追加，避免 CI 日志中同一段诊断重复出现。
+	if e.Output != "" {
+		msg = appendDiagnosticOnce(msg, e.Output)
+	}
+	return msg
 }
 
 // Unwrap 返回底层错误，支持 errors.Is/errors.As 穿透
@@ -66,6 +68,39 @@ func NewMultiError(errs []error) error {
 		return errs[0]
 	}
 	return errors.Join(errs...)
+}
+
+// summarizeSyncErrors 把同步过程中收集到的错误拆分为两类：
+//   - real：项目自身的真实失败（需要向用户报告并计入失败数）；
+//   - canceled：因 --fail-fast 或外部取消被中断的项目（不是项目失败，
+//     不能与真实失败混在一起统计，否则进度行与最终汇总会互相矛盾）。
+func summarizeSyncErrors(errs []error) (real []error, canceled int) {
+	real = make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) {
+			canceled++
+			continue
+		}
+		real = append(real, err)
+	}
+	return real, canceled
+}
+
+// syncProgressStatus 返回进度行中单个项目的状态文案。
+// 被取消的项目与真实失败必须区分显示：取消是 fail-fast/外部中断的结果，
+// 不应让用户误以为大量项目同步失败。
+func syncProgressStatus(err error) string {
+	switch {
+	case err == nil:
+		return "完成"
+	case errors.Is(err, context.Canceled):
+		return "已取消"
+	default:
+		return "失败"
+	}
 }
 
 // Options 包含同步引擎的选
@@ -200,22 +235,28 @@ func (e *Engine) Sync() error {
 		return err
 	}
 
-	// HyperSync 可能将同步范围缩减为已变更目的子集
+	// HyperSync 可能将同步范围缩减为已变更项目的子集。
+	// 未配置 manifest-server 时（runner 常无条件传 --hyper-sync），
+	// 必须安静地按全量项目同步，而不是打印 "cannot connect" 告警。
 	syncProjects := e.projects
-	if e.options.HyperSync {
-		if e.options.LocalOnly {
-			// --local-only 禁止任何网络操作：不向清单服务器发 HTTP，退化为全量本地同步。
-			e.logger.Info("--local-only 禁用网络：跳过 HyperSync 查询，按全量项目执行本地同步")
+	switch {
+	case !e.options.HyperSync:
+		// 未请求 HyperSync，全量同步。
+	case e.options.LocalOnly:
+		// --local-only 禁止任何网络操作：不向清单服务器发 HTTP，退化为全量本地同步。
+		e.logger.Info("--local-only 禁用网络：跳过 HyperSync 查询，按全量项目执行本地同步")
+	case !e.hyperSyncAvailable():
+		e.logger.Debug("HyperSync 已跳过：未配置 manifest-server，按全量项目同步")
+	default:
+		e.logger.Info("Using manifest server for HyperSync")
+		hyper, err := e.getHyperSyncProjects()
+		if err != nil {
+			e.logger.Warn("Failed to get HyperSync projects，将同步所有项目: %v", err)
+		} else if len(hyper) == 0 {
+			e.logger.Info("HyperSync: No projects need updating")
+			return nil
 		} else {
-			hyper, err := e.getHyperSyncProjects()
-			if err != nil {
-				e.logger.Warn("Failed to get HyperSync projects，将同步所有目: %v", err)
-			} else if len(hyper) == 0 {
-				e.logger.Info("HyperSync: No projects need updating")
-				return nil
-			} else {
-				syncProjects = hyper
-			}
+			syncProjects = hyper
 		}
 	}
 
@@ -238,6 +279,7 @@ func (e *Engine) Sync() error {
 	var count int32
 	var successCount int32
 	var failCount int32
+	var canceledCount int32
 
 	// 提交同步任务
 	for _, p := range syncProjects {
@@ -254,17 +296,20 @@ func (e *Engine) Sync() error {
 			err := e.syncProject(ctx, project)
 
 			current := atomic.AddInt32(&count, 1)
-			if err != nil {
-				atomic.AddInt32(&failCount, 1)
-			} else {
+			// fail-fast/外部取消打断的项目不是项目自身的同步失败，单独计数，
+			// 否则进度行会显示大量 "失败" 而最终汇总只报个别真实失败。
+			canceled := err != nil && errors.Is(err, context.Canceled)
+			switch {
+			case err == nil:
 				atomic.AddInt32(&successCount, 1)
+			case canceled:
+				atomic.AddInt32(&canceledCount, 1)
+			default:
+				atomic.AddInt32(&failCount, 1)
 			}
 
 			if !e.options.Quiet && e.progressReport != nil {
-				status := "完成"
-				if err != nil {
-					status = "failed"
-				}
+				status := syncProgressStatus(err)
 
 				// 计算预估完成时间
 				var etaStr string
@@ -277,9 +322,10 @@ func (e *Engine) Sync() error {
 					}
 				}
 
-				progressMsg := fmt.Sprintf("%s: %s (进度: %d/%d, 成功: %d, failed: %d%s)",
+				progressMsg := fmt.Sprintf("%s: %s (进度: %d/%d, 成功: %d, 失败: %d, 已取消: %d%s)",
 					project.Name, status, current, totalProjects,
-					atomic.LoadInt32(&successCount), atomic.LoadInt32(&failCount), etaStr)
+					atomic.LoadInt32(&successCount), atomic.LoadInt32(&failCount),
+					atomic.LoadInt32(&canceledCount), etaStr)
 				e.progressReport.Update(int(current), progressMsg)
 			}
 
@@ -306,6 +352,17 @@ func (e *Engine) Sync() error {
 		e.progressReport.Finish()
 	}
 
+	// 1.7 更新 .repo/project.list 并清理清单中已不存在的项目检出（对齐上游
+	// UpdateProjectList）。fail-fast/外部取消时跳过：上游在 fail-fast 下同样
+	// 不执行本地清理，避免被中断的同步顺带删除工作树。
+	if ctx.Err() == nil {
+		if cleanupErrs := e.updateProjectList(); len(cleanupErrs) > 0 {
+			e.errorsMu.Lock()
+			e.errors = append(e.errors, cleanupErrs...)
+			e.errorsMu.Unlock()
+		}
+	}
+
 	// 1.8 --auto-gc：Sync complete后对每个目运行 git gc --auto
 	if e.options.AutoGC {
 		e.runAutoGC(syncProjects)
@@ -314,28 +371,35 @@ func (e *Engine) Sync() error {
 	// 计算总耗时
 	totalDuration := time.Since(startTime)
 
-	// 汇总错
-	// fail-fast 或外部取消发生后，在途项目会被 ctx 打断并返回 context.Canceled，
-	// 这类错误不是项目自身的同步失败，不应计入最终汇总；
-	// 若过滤后为空（纯取消、无真实失败），保留原始错误，避免把被中断的同步误报为成功。
-	syncErrors := e.errors
-	if ctx.Err() != nil {
-		filtered := make([]error, 0, len(e.errors))
-		for _, err := range e.errors {
-			if errors.Is(err, context.Canceled) {
-				continue
-			}
-			filtered = append(filtered, err)
-		}
-		if len(filtered) > 0 {
-			syncErrors = filtered
-		}
+	// 汇总错误：fail-fast 或外部取消发生后，在途项目会被 ctx 打断并返回
+	// context.Canceled，这类错误不是项目自身的同步失败，必须与真实失败分开统计，
+	// 否则进度条（"失败"）与最终汇总（只剩真实失败）会互相矛盾。
+	realErrors, canceledErrs := summarizeSyncErrors(e.errors)
+	completed := int(atomic.LoadInt32(&count))
+	skipped := totalProjects - completed
+	if skipped < 0 {
+		skipped = 0
 	}
 
-	if len(syncErrors) > 0 {
-		e.logger.Error("Sync complete，有 %d 个目failed，总耗时: %s",
-			len(syncErrors), formatDuration(totalDuration))
-		return NewMultiError(syncErrors)
+	if len(realErrors) > 0 {
+		if canceledErrs > 0 || skipped > 0 {
+			e.logger.Error("Sync complete，有 %d 个项目失败，%d 个项目已取消，%d 个项目未执行，总耗时: %s",
+				len(realErrors), canceledErrs, skipped, formatDuration(totalDuration))
+		} else {
+			e.logger.Error("Sync complete，有 %d 个项目失败，总耗时: %s",
+				len(realErrors), formatDuration(totalDuration))
+		}
+		return NewMultiError(realErrors)
+	}
+
+	// 没有项目自身的失败，但同步被取消/中断（排队任务未执行）：不能静默返回成功。
+	if ctx.Err() != nil || canceledErrs > 0 || skipped > 0 {
+		e.logger.Warn("Sync 已取消，%d 个项目已取消，%d 个项目未执行，总耗时: %s",
+			canceledErrs, skipped, formatDuration(totalDuration))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("sync canceled: %w", ctxErr)
+		}
+		return fmt.Errorf("sync canceled: %d canceled, %d not synced", canceledErrs, skipped)
 	}
 
 	e.logger.Info("All projects synced，总耗时: %s", formatDuration(totalDuration))
@@ -387,11 +451,8 @@ func (e *Engine) preSync(_ context.Context) error {
 		}
 	}
 
-	// --force-remove-dirty 当前尚未在活动同步路径中实现（需带安全护栏的工作树移除，
-	// 与 prune 同级风险），此处显式告警而非静默忽略。
-	if e.options.ForceRemoveDirty {
-		e.logger.Warn("--force-remove-dirty 尚未在同步路径实现，本次将按常规方式处理脏目")
-	}
+	// --force-remove-dirty 的语义在 Sync 末尾 updateProjectList 中实现：
+	// 仅影响清单中已不存在的项目检出，脏工作树是否强制删除由它决定。
 	return nil
 }
 
@@ -599,13 +660,28 @@ func formatDuration(d time.Duration) string {
 }
 
 // fetchRetries 返回 fetch/clone 的重试次数，取自 --retry-fetches。
-// 上游 repo 默认值为 0（不重试）；0 是合法且必须可表达的配置，
+// 上游 repo 的选项默认值为 0（不额外重试）；0 是合法且必须可表达的配置，
 // 因此这里不做哨兵值替换。
 func (e *Engine) fetchRetries() int {
 	if e.options == nil || e.options.RetryFetches < 0 {
 		return 0
 	}
 	return e.options.RetryFetches
+}
+
+// minimumFetchRetries 是 fetch/clone 的最小重试次数（不含首次执行）。
+// 上游 repo 的 project._Fetch 会执行 `retry_fetches = max(retry_fetches, 2)`，
+// 即 --retry-fetches 为 0 时仍会尝试 2 次；repo-go 对齐该语义，避免单次
+// transient SSH/网络抖动（connection reset、connection closed）直接判失败。
+const minimumFetchRetries = 1
+
+// effectiveFetchRetries 返回 fetch/clone 实际使用的重试次数：
+// 取其配置值与上游最小值的较大者。
+func (e *Engine) effectiveFetchRetries() int {
+	if retries := e.fetchRetries(); retries > minimumFetchRetries {
+		return retries
+	}
+	return minimumFetchRetries
 }
 
 // syncProject 同步单个目
@@ -945,8 +1021,9 @@ func (e *Engine) fetchProject(ctx context.Context, p *project.Project) error {
 	e.networkSem <- struct{}{}
 	defer func() { <-e.networkSem }()
 
-	// Retry fetch using RetryWithBackoff with --retry-fetches (default 3)
-	maxRetries := e.fetchRetries()
+	// Retry fetch using RetryWithBackoff; 上游 _Fetch 至少尝试 2 次，
+	// 即使 --retry-fetches 为 0（transient 网络错误仍会重试一次）。
+	maxRetries := e.effectiveFetchRetries()
 	var stderrBuf bytes.Buffer
 
 	opts := RetryOptions{
@@ -1041,20 +1118,32 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 	// 检查是否为镜像模式：项目布局（p.Mirror）优先，兼容配置驱动
 	isMirror := p.Mirror || (e.options.Config != nil && e.options.Config.Mirror)
 
-	// 构建 clone 命令
-	args := e.buildCloneArgs(p, remoteURL, isMirror)
+	// 嵌套项目（如 A 的 worktree 位于 B 的 worktree 之下）不能直接
+	// `git clone` 到 worktree：并发时子项目会先 MkdirAll 出祖先目录，
+	// 或用父项目已检出的内容占用目标路径，导致 git 报
+	// “目标路径已存在且不是空目录”。这类项目先克隆到 .repo/tmp，
+	// 成功后再合并到最终 worktree。
+	nested := e.hasNestedProjectPath(cloneDest)
+
+	// 构建 clone 命令；嵌套项目每次尝试都指向独立的临时目录，
+	// 在循环内按临时路径构造，避免重复记录分支日志。
+	var args []string
+	if !nested {
+		args = e.buildCloneArgs(p, remoteURL, isMirror)
+	}
 
 	// 1.6 限制并发网络操作数（--jobs-network）；clone 是网络密集型操作
 	e.networkSem <- struct{}{}
 	defer func() { <-e.networkSem }()
 
-	// 1.4 添加重试机制：使用 --retry-fetches（上游默认 0，即不重试）
-	maxRetries := e.fetchRetries()
+	// 上游 clone 走 _Fetch，重试次数同样取 max(--retry-fetches, 2) 的尝试预算。
+	maxRetries := e.effectiveFetchRetries()
 	// 记录本次运行前的目标目录状态：只有“本次运行前不存在/为空”的目录
 	// 才能在重试时安全清理；含用户数据的目录必须显式 --force-sync。
 	targetState := inspectCloneTarget(cloneDest)
 	// 运行前已存在且非空的目录：无 --force-sync 时直接拒绝，避免触碰用户数据。
-	if targetState.existed && !targetState.empty && !e.options.ForceSync && !isBareGitRepo(cloneDest) {
+	// 嵌套项目路径下的目录可能由其他项目创建，不属于用户数据，放行合并。
+	if !nested && targetState.existed && !targetState.empty && !e.options.ForceSync && !isBareGitRepo(cloneDest) {
 		return &SyncError{
 			ProjectName: p.Name,
 			Phase:       "clone",
@@ -1070,8 +1159,9 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 	// --force-sync 下运行前已存在的非空目录视为损坏/残留：必须在第一次
 	// clone（retryCount==0）前清理，否则 --retry-fetches 0 时没有任何重试
 	// 机会执行清理，force-sync 无法恢复。有效裸仓库与删除安全校验仍由
-	// cleanupIncompleteCloneState 负责。
-	cleanupBeforeFirstClone := e.options.ForceSync && targetState.existed && !targetState.empty
+	// cleanupIncompleteCloneState 负责。嵌套路径不能删除：目录里可能已有
+	// 已克隆的子项目工作树。
+	cleanupBeforeFirstClone := !nested && e.options.ForceSync && targetState.existed && !targetState.empty
 	if cleanupBeforeFirstClone {
 		if cleanupErr := e.cleanupIncompleteCloneState(p, targetState); cleanupErr != nil {
 			return &SyncError{
@@ -1105,27 +1195,70 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 			stderr.Reset()
 
 			// 清理上次克隆残留：本次运行前为空/不存在的目录可直接清理，
-			// 含用户数据的目录仅在 --force-sync 下允许。
-			if cleanupErr := e.cleanupIncompleteCloneState(p, targetState); cleanupErr != nil {
-				return &SyncError{
-					ProjectName: p.Name,
-					Phase:       "clone",
-					Err:         cleanupErr,
-					Timestamp:   time.Now(),
-					RetryCount:  retryCount,
+			// 含用户数据的目录仅在 --force-sync 下允许。嵌套项目直接克隆
+			// 到临时目录，失败只清理临时目录，不能触碰最终 worktree。
+			if !nested {
+				if cleanupErr := e.cleanupIncompleteCloneState(p, targetState); cleanupErr != nil {
+					return &SyncError{
+						ProjectName: p.Name,
+						Phase:       "clone",
+						Err:         cleanupErr,
+						Timestamp:   time.Now(),
+						RetryCount:  retryCount,
+					}
 				}
 			}
 		}
 
+		// 嵌套项目克隆到 .repo/tmp 下的临时目录，成功后合并到最终路径，
+		// 避免与父/子项目并发创建目录产生“目标已存在且非空”冲突。
+		tempDest := ""
+		cloneArgs := args
+		if nested {
+			created, createErr := e.newCloneTempDir()
+			if createErr != nil {
+				return &SyncError{
+					ProjectName: p.Name,
+					Phase:       "clone",
+					Err:         fmt.Errorf("failed to create temporary clone directory: %w", createErr),
+					Timestamp:   time.Now(),
+					RetryCount:  retryCount,
+				}
+			}
+			tempDest = created
+			cloneArgs = e.buildCloneArgsForDest(p, remoteURL, isMirror, tempDest)
+		}
+		cleanupTemp := func() {
+			if tempDest != "" {
+				_ = os.RemoveAll(tempDest)
+				tempDest = ""
+			}
+		}
+
 		// 执行 clone 命令
-		_, stderrStr, runErr := e.runGitWithStderr(args)
+		_, stderrStr, runErr := e.runGitWithStderr(cloneArgs)
 		stderr.WriteString(stderrStr)
 		lastErr = runErr
 
 		if lastErr == nil {
+			if nested {
+				if finErr := e.relocateNestedClone(cloneDest, tempDest); finErr != nil {
+					cleanupTemp()
+					return &SyncError{
+						ProjectName: p.Name,
+						Phase:       "clone",
+						Err:         finErr,
+						Timestamp:   time.Now(),
+						RetryCount:  retryCount,
+					}
+				}
+				cleanupTemp()
+			}
 			// 成功克隆，跳出重试循环
 			break
 		}
+
+		cleanupTemp()
 
 		// ctx 在 clone 执行期间被取消（fail-fast/外部取消）：立即返回，
 		// 并保留 ctx 语义供 errors.Is 检测。
@@ -1142,7 +1275,8 @@ func (e *Engine) cloneProject(ctx context.Context, p *project.Project) error {
 
 		// git clone 在 checkout 阶段失败时会留下可用的 .git（对象已下载）。
 		// 若目录是本次运行新建/原本为空，尝试恢复工作树而不是直接放弃。
-		if !isMirror && e.canReuseCloneTarget(targetState) && e.recoverIncompleteCloneCheckout(p) {
+		// 嵌套项目在临时目录内克隆，失败后临时目录已清理，不做原地恢复。
+		if !nested && !isMirror && e.canReuseCloneTarget(targetState) && e.recoverIncompleteCloneCheckout(p) {
 			e.logger.Warn("clone for project %s failed during checkout; recovered existing repository", p.Name)
 			lastErr = nil
 			break
@@ -1340,6 +1474,12 @@ func (e *Engine) recoverIncompleteCloneCheckout(p *project.Project) bool {
 // buildCloneArgs 构造 git clone 参数（不含执行），便于对参数构造做单元测试。
 // isMirror 由调用方根据配置判定并用于跳过分支参数。
 func (e *Engine) buildCloneArgs(p *project.Project, remoteURL string, isMirror bool) []string {
+	return e.buildCloneArgsForDest(p, remoteURL, isMirror, projectRepoDir(p))
+}
+
+// buildCloneArgsForDest 与 buildCloneArgs 相同，但允许指定目标目录。
+// 嵌套项目先克隆到临时目录，再通过 relocateNestedClone 合并到最终 worktree。
+func (e *Engine) buildCloneArgsForDest(p *project.Project, remoteURL string, isMirror bool, dest string) []string {
 	args := []string{"clone"}
 
 	// --no-clone-bundle：repo-go 不实现 /clone.bundle 下载，保持 no-op，
@@ -1432,9 +1572,170 @@ func (e *Engine) buildCloneArgs(p *project.Project, remoteURL string, isMirror b
 	}
 
 	// 添加远程URL和目标目录
-	args = append(args, remoteURL, projectRepoDir(p))
+	args = append(args, remoteURL, dest)
 
 	return args
+}
+
+// hasNestedProjectPath 判断 dest 与任一其他项目的工作树是否存在祖先/后代关系。
+// 嵌套项目并发 clone 时会互相创建目标路径（如子项目先 MkdirAll 出父目录），
+// 因此必须走“临时目录 clone + 合并”路径，不能直接 clone 到 worktree。
+func (e *Engine) hasNestedProjectPath(dest string) bool {
+	if dest == "" {
+		return false
+	}
+	destAbs, err := filepath.Abs(dest)
+	if err != nil {
+		destAbs = filepath.Clean(dest)
+	}
+	for _, q := range e.projects {
+		if q == nil || q.Mirror {
+			continue
+		}
+		qDir := projectRepoDir(q)
+		if qDir == "" {
+			continue
+		}
+		qAbs, absErr := filepath.Abs(qDir)
+		if absErr != nil {
+			continue
+		}
+		if qAbs == destAbs {
+			continue
+		}
+		if pathIsWithin(destAbs, qAbs) || pathIsWithin(qAbs, destAbs) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathIsWithin 判断 child 是否位于 parent 之下（不包含相等路径）。
+func pathIsWithin(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// newCloneTempDir 在 .repo/tmp 下创建本次 clone 的临时目录。
+// 与最终 worktree 位于同一文件系统，保证成功后可用 rename 原子落位。
+// 临时目录先以 0700 隔离，落位后由 relocateNestedClone 调整为 0755，
+// 与普通 git clone 创建的工作树权限一致。
+func (e *Engine) newCloneTempDir() (string, error) {
+	root := os.TempDir()
+	if e.repoRoot != "" {
+		root = filepath.Join(e.repoRoot, ".repo", "tmp")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("failed to create clone temp root %s: %w", root, err)
+	}
+	if err := os.Chmod(root, 0700); err != nil {
+		return "", fmt.Errorf("failed to secure clone temp root %s: %w", root, err)
+	}
+	return os.MkdirTemp(root, "clone-")
+}
+
+// relocateNestedClone 把临时 clone 目录落位到最终 worktree。
+// 目标不存在/为空时直接 rename；目标已由父/子项目创建时递归合并，
+// 保留已有项目内容并写入本次 clone 的 .git 与工作树文件。
+func (e *Engine) relocateNestedClone(dest, tempDest string) error {
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return fmt.Errorf("failed to create parent of %s: %w", dest, err)
+	}
+	// MkdirTemp 默认 0700；落位后应表现为普通 git clone 的 0755 目录。
+	if err := os.Chmod(tempDest, 0755); err != nil {
+		return fmt.Errorf("failed to set permissions on temporary clone %s: %w", tempDest, err)
+	}
+
+	info, err := os.Stat(dest)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(tempDest, dest); err != nil {
+			return fmt.Errorf("failed to move cloned project into %s: %w", dest, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to inspect clone destination %s: %w", dest, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("clone destination %s exists and is not a directory", dest)
+	}
+
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		return fmt.Errorf("failed to read clone destination %s: %w", dest, err)
+	}
+	if len(entries) == 0 {
+		if err := os.Remove(dest); err != nil {
+			return fmt.Errorf("failed to remove empty clone destination %s: %w", dest, err)
+		}
+		if err := os.Rename(tempDest, dest); err != nil {
+			return fmt.Errorf("failed to move cloned project into %s: %w", dest, err)
+		}
+		return nil
+	}
+
+	// 目标非空：只允许合并“由其他嵌套项目创建”的目录，不能覆盖已有 git 仓库。
+	if isBareGitRepo(dest) {
+		return fmt.Errorf("clone destination %s already contains a bare git repository", dest)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, ".git")); statErr == nil {
+		return fmt.Errorf("clone destination %s already contains a git repository", dest)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("failed to inspect %s/.git: %w", dest, statErr)
+	}
+
+	e.logger.Debug("merging nested clone for %s into existing directory", dest)
+	if err := mergeCloneTree(tempDest, dest); err != nil {
+		return fmt.Errorf("failed to merge nested clone into %s: %w", dest, err)
+	}
+	return nil
+}
+
+// mergeCloneTree 把 src 目录内容递归合并进 dst：
+//   - 目标不存在：直接 rename（同文件系统，O(1)）；
+//   - 两侧都是目录：递归合并；
+//   - 其余冲突：用源文件替换目标文件，目标为目录时拒绝，避免静默破坏。
+func mergeCloneTree(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %w", src, err)
+	}
+	for _, entry := range entries {
+		from := filepath.Join(src, entry.Name())
+		to := filepath.Join(dst, entry.Name())
+
+		toInfo, statErr := os.Lstat(to)
+		if errors.Is(statErr, os.ErrNotExist) {
+			if err := os.Rename(from, to); err != nil {
+				return fmt.Errorf("failed to move %s to %s: %w", from, to, err)
+			}
+			continue
+		}
+		if statErr != nil {
+			return fmt.Errorf("failed to inspect %s: %w", to, statErr)
+		}
+
+		fromInfo, infoErr := entry.Info()
+		if infoErr != nil {
+			return fmt.Errorf("failed to inspect %s: %w", from, infoErr)
+		}
+		if fromInfo.IsDir() && toInfo.IsDir() {
+			if err := mergeCloneTree(from, to); err != nil {
+				return err
+			}
+			continue
+		}
+		if toInfo.IsDir() {
+			return fmt.Errorf("cannot merge %s: destination is a directory", from)
+		}
+		if err := os.Rename(from, to); err != nil {
+			return fmt.Errorf("failed to move %s to %s: %w", from, to, err)
+		}
+	}
+	return nil
 }
 
 // checkoutProject 将工作树对齐到 manifest revision,语义对齐上游 Sync_LocalHalf:

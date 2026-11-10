@@ -19,6 +19,7 @@ type Options struct {
 	JobsNetwork            int
 	JobsCheckout           int
 	SmartSync              bool
+	SmartSyncOptional      bool // smartsync 命令：清单未配置 manifest-server 时回退常规同步
 	SmartTag               string
 	UseSuperproject        bool
 	HyperSync              bool

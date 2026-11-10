@@ -38,6 +38,12 @@ func (e *Engine) handleSmartSync() error {
 	manifestServer := e.manifestServerURL()
 	explicit := e.explicitSmartSync()
 	if manifestServer == "" {
+		// repo smartsync 允许零必填参数：清单未声明 manifest-server 时
+		// 告警并退化为常规同步，而不是要求用户额外提供服务器地址。
+		if e.options != nil && e.options.SmartSyncOptional {
+			e.logger.Warn("manifest-server not defined in manifest，跳过智能同步，将按当前清单执行常规同步")
+			return nil
+		}
 		if explicit {
 			return fmt.Errorf("cannot smart sync: no manifest server defined in manifest (or --manifest-server-url)")
 		}
@@ -129,6 +135,47 @@ func (e *Engine) manifestServerHelper() string {
 		return strings.TrimSpace(e.manifest.ManifestServer.Helper)
 	}
 	return ""
+}
+
+// manifestServerRequestURL 把清单服务器地址规范化为可 POST 的 HTTP(S)
+// URL，与上游 repo 的 scheme 规则保持一致：
+//   - http/https 原样使用；
+//   - persistent-http / persistent-https 去掉 persistent- 前缀，
+//     helper 代理存在时 persistent-https 降级为 http（由代理完成 TLS）；
+//   - 其它 scheme（如 ssh）仅在声明了 helper 时可用，helper 返回的 HTTP
+//     代理负责实际传输，此时同样按 http 发起请求；
+//   - 无 helper 又使用不支持的 scheme 时立即报错，避免发起注定失败的
+//     请求并白等三次重试。
+func manifestServerRequestURL(serverURL string, helperConfigured bool) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(serverURL))
+	if err != nil {
+		return "", fmt.Errorf("invalid manifest server URL %q: %w", serverURL, err)
+	}
+
+	switch parsed.Scheme {
+	case "http", "https":
+		return parsed.String(), nil
+	case "persistent-http":
+		parsed.Scheme = "http"
+		return parsed.String(), nil
+	case "persistent-https":
+		if helperConfigured {
+			parsed.Scheme = "http"
+		} else {
+			parsed.Scheme = "https"
+		}
+		return parsed.String(), nil
+	}
+
+	if helperConfigured {
+		parsed.Scheme = "http"
+		return parsed.String(), nil
+	}
+
+	return "", fmt.Errorf(
+		"unsupported manifest server scheme %q (supported: http, https, persistent-http, persistent-https)",
+		parsed.Scheme,
+	)
 }
 
 // defaultSyncSmartSyncEnabled 读取清单 <default sync-smartsync="true">。
@@ -281,7 +328,10 @@ type xmlRPCMember struct {
 // callManifestServerRPC 以 XML-RPC POST 调用清单服务器并解析
 // methodResponse。网络错误最多重试 3 次（与既有行为一致）。
 func (e *Engine) callManifestServerRPC(ctx context.Context, serverURL, method string, params []string) (bool, string, error) {
-	requestURL := strings.TrimPrefix(serverURL, "persistent-")
+	requestURL, err := manifestServerRequestURL(serverURL, e.manifestServerHelper() != "")
+	if err != nil {
+		return false, "", err
+	}
 	if e.options != nil && !strings.Contains(requestURL, "@") {
 		username, password := e.options.ManifestServerUsername, e.options.ManifestServerPassword
 		if username != "" && password != "" {

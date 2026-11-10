@@ -236,6 +236,30 @@ func TestSyncFailFastInterruptsInFlightRetry(t *testing.T) {
 	}
 }
 
+// TestSyncCanceledContextDoesNotReportSuccess 验证同步上下文在开始前已被取消时，
+// Sync 不得静默返回成功：排队任务全部未执行，必须返回可被 errors.Is 检测的取消错误。
+func TestSyncCanceledContextDoesNotReportSuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 模拟 fail-fast/外部取消已发生
+
+	base := t.TempDir()
+	projects := []*project.Project{
+		{Name: "p/a", Worktree: filepath.Join(base, "a")},
+		{Name: "p/b", Worktree: filepath.Join(base, "b")},
+	}
+	e := NewEngineWithContext(ctx, &Options{Jobs: 1, Quiet: true}, &manifest.Manifest{}, logger.NewDefaultLogger())
+	e.SetProjects(projects)
+	defer e.Cleanup()
+
+	err := e.Sync()
+	if err == nil {
+		t.Fatal("ctx 已取消时 Sync() 不应返回 nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Sync() 错误应包装 context.Canceled，实际: %v", err)
+	}
+}
+
 // TestFetchProjectTagsFlags 验证 fetch 的 --tags/--no-tags 参数对齐上游
 // Sync_LocalHalf：CLI 显式值（--tags/--no-tags）覆盖项目级，未指定时按
 // 项目 sync-tags（继承 default，缺省 true）逐项目判定。

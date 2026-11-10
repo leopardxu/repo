@@ -8,6 +8,7 @@ import (
 
 	"github.com/leopardxu/repo-go/internal/logger"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // TestValidateSyncOptionsRejectsInvalidCombinations 验证 -n/-l、-n/-d 组合
@@ -27,6 +28,34 @@ func TestValidateSyncOptionsRejectsInvalidCombinations(t *testing.T) {
 			name:    "network-only with detach",
 			opts:    &SyncOptions{NetworkOnly: true, Detach: true},
 			wantErr: "cannot combine -n and -d",
+		},
+		{
+			name:    "manifest-name with smart-sync",
+			opts:    &SyncOptions{ManifestName: "tmp.xml", SmartSync: true},
+			wantErr: "cannot combine -m and -s",
+		},
+		{
+			name:    "manifest-name with smart-tag",
+			opts:    &SyncOptions{ManifestName: "tmp.xml", SmartTag: "build-1"},
+			wantErr: "cannot combine -m and -t",
+		},
+		{
+			name: "smartsync allows manifest-name",
+			opts: &SyncOptions{ManifestName: "tmp.xml", SmartSync: true, SmartSyncOptional: true},
+		},
+		{
+			name:    "username without password",
+			opts:    &SyncOptions{ManifestServerUsername: "user"},
+			wantErr: "both -u and -p must be given",
+		},
+		{
+			name:    "password without username",
+			opts:    &SyncOptions{ManifestServerPassword: "pass"},
+			wantErr: "both -u and -p must be given",
+		},
+		{
+			name: "username and password together",
+			opts: &SyncOptions{ManifestServerUsername: "user", ManifestServerPassword: "pass"},
 		},
 		{
 			name: "valid combination",
@@ -81,35 +110,53 @@ func TestRunSyncExplicitSmartSyncWithoutServerFails(t *testing.T) {
 	})
 }
 
-// TestSmartSyncCmdWithoutServerFails 验证 `repo smartsync`（等价 sync -s）
-// 无 manifest-server 时同样报错，而不是按常规同步继续。
-func TestSmartSyncCmdWithoutServerFails(t *testing.T) {
-	repoRoot := readCmdTestRepoRoot(t, `  <project name="foo" path="foo" revision="main" />`)
-	readCmdWithCwd(t, repoRoot, func() {
-		cmd := SmartSyncCmd()
-		cmd.SilenceUsage = true
-		cmd.SilenceErrors = true
-		cmd.SetArgs([]string{"--local-only", "--quiet"})
+// TestSmartSyncCmdUpstreamFlagSet 验证 smartsync 暴露上游帮助中的选项，
+// 且不暴露只属于 sync 的 smart-sync/smart-tag 或 repo-go 的扩展选项。
+func TestSmartSyncCmdUpstreamFlagSet(t *testing.T) {
+	cmd := SmartSyncCmd()
 
-		_, _, runErr := readCmdRunCaptured(t, func() error {
-			return cmd.Execute()
-		})
-		if runErr == nil || !strings.Contains(runErr.Error(), "smart-sync failed") {
-			t.Fatalf("repo smartsync 无 manifest-server 应报错，实际: %v", runErr)
+	wantFlags := []string{
+		"jobs", "jobs-network", "jobs-checkout", "force-broken", "fail-fast",
+		"force-sync", "force-remove-dirty", "force-overwrite", "local-only",
+		"no-manifest-update", "nmu", "network-only", "detach", "current-branch",
+		"no-current-branch", "manifest-name", "clone-bundle", "no-clone-bundle",
+		"manifest-server-username", "manifest-server-password", "fetch-submodules",
+		"use-superproject", "no-use-superproject", "tags", "no-tags",
+		"optimized-fetch", "retry-fetches", "prune", "no-prune", "hyper-sync",
+		"load-aiconfig", "verbose", "quiet", "outer-manifest", "no-outer-manifest",
+		"this-manifest-only", "no-this-manifest-only", "all-manifests", "no-repo-verify",
+	}
+	for _, name := range wantFlags {
+		if cmd.Flags().Lookup(name) == nil {
+			t.Errorf("smartsync 缺少上游选项 --%s", name)
 		}
-	})
+	}
+
+	// 上游 smartsync 不暴露 smart-sync/smart-tag，也不接受 repo-go 扩展选项。
+	for _, name := range []string{"smart-sync", "smart-tag", "groups", "manifest-server-url", "no-manifest-server", "auto-gc", "git-lfs"} {
+		if cmd.Flags().Lookup(name) != nil {
+			t.Errorf("smartsync 不应注册 --%s", name)
+		}
+	}
+
+	// -p 必须是 manifest-server-password（上游语义），--prune 无短选项。
+	if f := cmd.Flags().Lookup("manifest-server-password"); f == nil || f.Shorthand != "p" {
+		t.Errorf("--manifest-server-password 短选项 = %q, want p", shorthandOf(f))
+	}
+	if f := cmd.Flags().Lookup("prune"); f == nil || f.Shorthand != "" {
+		t.Errorf("--prune 短选项 = %q, want empty", shorthandOf(f))
+	}
+	if f := cmd.Flags().Lookup("tags"); f == nil || f.Shorthand != "" {
+		t.Errorf("--tags 短选项 = %q, want empty", shorthandOf(f))
+	}
 }
 
-// TestSmartSyncCmdDoesNotRegisterSmartSyncFlag 验证 smartsync 快捷命令不暴露
-// --smart-sync（已自动启用），但仍注册 --manifest-server-url。
-func TestSmartSyncCmdDoesNotRegisterSmartSyncFlag(t *testing.T) {
-	cmd := SmartSyncCmd()
-	if cmd.Flags().Lookup("smart-sync") != nil {
-		t.Error("smartsync 不应注册 --smart-sync")
+// shorthandOf 返回 flag 的短选项，flag 为 nil 时返回空串。
+func shorthandOf(f *pflag.Flag) string {
+	if f == nil {
+		return ""
 	}
-	if cmd.Flags().Lookup("manifest-server-url") == nil {
-		t.Error("smartsync 应注册 --manifest-server-url")
-	}
+	return f.Shorthand
 }
 
 // TestRunSyncPrintsNoticeOnFailureAndQuiet 验证 <notice> 在同步失败时也按原样

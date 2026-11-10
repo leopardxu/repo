@@ -13,13 +13,27 @@ import (
 	"github.com/leopardxu/repo-go/internal/project"
 )
 
+// hyperSyncAvailable 判断 HyperSync 是否具备可用的清单服务器。
+// 未配置 manifest-server（清单未声明且未用 --manifest-server-url 指定）
+// 或显式 --no-manifest-server 时，HyperSync 直接退化为全量同步，
+// 不产生 "Using manifest server"/"cannot connect" 之类的告警噪音。
+func (e *Engine) hyperSyncAvailable() bool {
+	if e == nil || e.options == nil || !e.options.HyperSync {
+		return false
+	}
+	if e.options.NoManifestServer {
+		return false
+	}
+	return e.manifestServerURL() != ""
+}
+
 // manifestServerClient builds an authenticated manifest server URL and HTTP client.
 // Shared by getHyperSyncProjects and getChangedProjectsFromServer to avoid duplication.
 func (e *Engine) manifestServerClient() (string, *http.Client, error) {
-	if e.manifest.ManifestServer == nil {
+	manifestServer := e.manifestServerURL()
+	if manifestServer == "" {
 		return "", nil, fmt.Errorf("cannot connect: manifest server not defined")
 	}
-	manifestServer := e.manifest.ManifestServer.URL
 
 	// Handle authentication
 	if !strings.Contains(manifestServer, "@") {
@@ -91,13 +105,11 @@ func (e *Engine) fetchChangedProjects() ([]string, error) {
 }
 
 // getHyperSyncProjects returns the subset of projects that need HyperSync.
+// 调用方须先用 hyperSyncAvailable 确认服务器可用；本函数不再自行打印
+// "Using manifest server"，避免无服务器时先输出误导性信息再告警。
 func (e *Engine) getHyperSyncProjects() ([]*project.Project, error) {
 	if !e.options.HyperSync {
 		return nil, nil
-	}
-
-	if !e.options.Quiet {
-		fmt.Printf("Using manifest server for HyperSync\n")
 	}
 
 	changedProjects, err := e.fetchChangedProjects()

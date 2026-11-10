@@ -16,8 +16,9 @@ import (
 )
 
 // TestFetchRetries 验证 fetch/clone 重试次数取自 Options.RetryFetches。
-// 上游 repo 的 --retry-fetches 默认值为 0（不重试），0 是合法配置，
-// 不能被替换成哨兵默认值。
+// 上游 repo 的 --retry-fetches 默认值为 0（不额外重试），0 是合法配置，
+// 不能被替换成哨兵默认值；实际执行时 effectiveFetchRetries 会应用
+// 上游 _Fetch 的 max(retry_fetches, 2) 最小尝试预算。
 func TestFetchRetries(t *testing.T) {
 	tests := []struct {
 		name string
@@ -37,6 +38,32 @@ func TestFetchRetries(t *testing.T) {
 			got := e.fetchRetries()
 			if got != tt.want {
 				t.Errorf("fetchRetries() = %d, want %d (RetryFetches=%d)", got, tt.want, tt.opts.RetryFetches)
+			}
+		})
+	}
+}
+
+// TestEffectiveFetchRetries 验证实际重试预算对齐上游 _Fetch：
+// retry_fetches = max(--retry-fetches, 2) 次尝试，即至少重试 1 次。
+func TestEffectiveFetchRetries(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *Options
+		want int
+	}{
+		{"zero gets minimum retry", &Options{RetryFetches: 0}, 1},
+		{"negative gets minimum retry", &Options{RetryFetches: -1}, 1},
+		{"one stays one", &Options{RetryFetches: 1}, 1},
+		{"two stays two", &Options{RetryFetches: 2}, 2},
+		{"explicit value preserved", &Options{RetryFetches: 5}, 5},
+		{"nil options get minimum", nil, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &Engine{options: tt.opts}
+			if got := e.effectiveFetchRetries(); got != tt.want {
+				t.Errorf("effectiveFetchRetries() = %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -1078,6 +1105,64 @@ func TestCloneProjectForceSyncRecoversWithZeroRetries(t *testing.T) {
 	}
 	if string(data) != "hello\n" {
 		t.Errorf("file.txt = %q, want hello", string(data))
+	}
+}
+
+// TestCloneProjectNestedWorktreeMergesIntoExistingDir 回归测试：
+// 嵌套项目（父项目 worktree 包含子项目 worktree）并发 clone 时，
+// 子项目可能先创建父项目目录，直接 git clone 会报“目标已存在且非空”。
+// 父项目应改用临时目录 clone 后合并，且不得删除子项目已创建的内容。
+func TestCloneProjectNestedWorktreeMergesIntoExistingDir(t *testing.T) {
+	root, bare, _, _ := setupRemoteWithCommit(t)
+	parentWT := filepath.Join(root, "npu", "ai_demo")
+	childWT := filepath.Join(parentWT, "linux", "edge-slm")
+
+	// 模拟并发的子项目先 MkdirAll，使父项目目标目录非空。
+	if err := os.MkdirAll(childWT, 0755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(childWT, "marker.txt")
+	if err := os.WriteFile(marker, []byte("child"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := &project.Project{
+		Name:       "ai_demo",
+		RemoteName: "origin",
+		RemoteURL:  bare,
+		Worktree:   parentWT,
+		Revision:   "main",
+	}
+	child := &project.Project{
+		Name:       "edge-slm",
+		RemoteName: "origin",
+		RemoteURL:  bare,
+		Worktree:   childWT,
+		Revision:   "main",
+	}
+	m := &manifest.Manifest{Topdir: root, RepoDir: filepath.Join(root, ".repo")}
+	e := NewEngine(&Options{
+		Jobs:      1,
+		Quiet:     true,
+		ForceSync: true, // 构建环境常用；嵌套路径绝不能触发删除子项目目录
+	}, m, logger.NewDefaultLogger())
+	e.projects = []*project.Project{parent, child}
+
+	if err := e.cloneProject(context.Background(), parent); err != nil {
+		t.Fatalf("嵌套项目 clone 应合并到已存在目录，实际: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(parentWT, "file.txt"))
+	if err != nil {
+		t.Fatalf("父项目工作树应被填充: %v", err)
+	}
+	if string(data) != "hello\n" {
+		t.Errorf("file.txt = %q, want hello", string(data))
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "child" {
+		t.Fatalf("子项目已创建的内容不应被删除: data=%q err=%v", string(data), err)
+	}
+	if _, err := os.Stat(filepath.Join(childWT, ".git")); !os.IsNotExist(err) {
+		t.Errorf("父项目 clone 不应改写子项目工作树，stat err = %v", err)
 	}
 }
 

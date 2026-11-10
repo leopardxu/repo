@@ -46,6 +46,12 @@ type SyncOptions struct {
 	ManifestServerPassword string
 	ManifestServerURL      string // manifest服务器URL
 	NoManifestServer       bool   // 禁用manifest服务器
+	ManifestName           string // -m/--manifest-name：本次同步临时使用的清单文件名
+	CloneBundle            bool   // --clone-bundle：启用 /clone.bundle（repo-go 为 no-op）
+	LoadAIConfig           bool   // --load-aiconfig：CIX 内部选项
+	NoRepoVerify           bool   // --no-repo-verify：单二进制实现无需校验，接受但忽略
+	PruneDefaultOn         bool   // smartsync：未显式指定 prune 时默认启用（对齐上游 --prune 默认）
+	SmartSyncOptional      bool   // smartsync 命令：缺少 manifest-server 时回退常规同步
 	UseSuperproject        bool
 	NoUseSuperproject      bool
 	HyperSync              bool
@@ -165,6 +171,20 @@ func validateSyncOptions(opts *SyncOptions) error {
 	if opts.NetworkOnly && opts.LocalOnly {
 		return fmt.Errorf("cannot combine -n and -l")
 	}
+	// 上游 smartsync 在选项解析后自动开启 smart-sync，因此同一校验
+	// 只在 sync -s/--smart-tag 上生效；smartsync 命令通过
+	// SmartSyncOptional 声明“缺少服务器时回退”，允许同时给出 -m。
+	if opts.ManifestName != "" && opts.SmartSync && !opts.SmartSyncOptional {
+		return fmt.Errorf("cannot combine -m and -s")
+	}
+	if opts.ManifestName != "" && opts.SmartTag != "" {
+		return fmt.Errorf("cannot combine -m and -t")
+	}
+	hasUsername := opts.ManifestServerUsername != ""
+	hasPassword := opts.ManifestServerPassword != ""
+	if hasUsername != hasPassword {
+		return fmt.Errorf("both -u and -p must be given")
+	}
 	return nil
 }
 
@@ -173,6 +193,21 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 	if err := validateSyncOptions(opts); err != nil {
 		log.Error("参数组合无效: %v", err)
 		return err
+	}
+
+	// 对齐上游 validate：-f/--force-broken 已无实际作用，仅保留兼容。
+	if opts.ForceBroken {
+		log.Warn("-f/--force-broken is now the default behavior, and the options are deprecated")
+	}
+
+	// smartsync 的 --prune 与上游一致默认为开启；显式 --no-prune 优先。
+	if opts.PruneDefaultOn && !cmd.Flags().Changed("prune") && !cmd.Flags().Changed("no-prune") {
+		opts.Prune = true
+	}
+
+	// --load-aiconfig 是 CIX 内部选项，repo-go 无对应 AI 配置来源，显式提示而非静默忽略。
+	if opts.LoadAIConfig {
+		log.Warn("--load-aiconfig 为 CIX 内部特性，当前 repo-go 仅兼容解析该选项")
 	}
 
 	// 确保在repo根目录下执行
@@ -195,9 +230,13 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 	}
 	opts.Config = cfg
 
-	// 检查manifest.xml 文件是否存在
+	// 检查清单文件：默认读取合并快照 .repo/manifest.xml；-m/--manifest-name
+	// 时按上游 Override 语义交给解析器在 .repo/manifests/ 下查找指定文件。
 	manifestPath := filepath.Join(cfg.RepoRoot, ".repo", "manifest.xml")
-	if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+	parsePath := manifestPath
+	if opts.ManifestName != "" {
+		parsePath = opts.ManifestName
+	} else if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
 		log.Error("manifest.xml文件不存在，请先运行 'repo init' 命令")
 		return fmt.Errorf("manifest.xml文件不存在，请先运行 'repo init' 命令")
 	}
@@ -234,8 +273,8 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 		log.Info("manifest 仓库更新完成")
 	}
 
-	// 加载合并后的清单文件(.repo/manifest.xml)，不使用原始仓库列表
-	log.Debug("正在加载合并后的清单文件: %s", manifestPath)
+	// 加载清单文件（默认 .repo/manifest.xml；-m 时使用指定清单）
+	log.Debug("正在加载清单文件: %s", parsePath)
 	parser := manifest.NewParser()
 	var groupsSlice []string
 	if opts.Groups != "" {
@@ -250,7 +289,7 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 	}
 
 	// 解析合并后的清单文件，根据组过滤项目
-	manifestObj, err := parser.ParseFromFile(manifestPath, groupsSlice)
+	manifestObj, err := parser.ParseFromFile(parsePath, groupsSlice)
 	if err != nil {
 		log.Error("failed to parse manifest: %v", err)
 		return fmt.Errorf("failed to parse manifest: %w", err)
@@ -348,27 +387,30 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 	}
 
 	engine := repo_sync.NewEngine(&repo_sync.Options{
-		Jobs:                   opts.Jobs,
-		JobsNetwork:            opts.JobsNetwork,
-		JobsCheckout:           opts.JobsCheckout,
-		CurrentBranch:          currentBranch,
-		Detach:                 opts.Detach,
-		ForceSync:              opts.ForceSync,
-		ForceRemoveDirty:       opts.ForceRemoveDirty,
-		ForceOverwrite:         opts.ForceOverwrite,
-		ForceBroken:            opts.ForceBroken,
-		LocalOnly:              opts.LocalOnly,
-		NetworkOnly:            opts.NetworkOnly,
-		Prune:                  opts.Prune && !opts.NoPrune,
-		Quiet:                  opts.Quiet,
-		Verbose:                opts.Verbose,
-		SmartSync:              opts.SmartSync,
-		Tags:                   opts.Tags && !opts.NoTags,
-		NoTags:                 opts.NoTags,
-		FetchSubmodules:        opts.FetchSubmodules || cfg.Submodules, // 命令行参数或配置文件
-		OptimizedFetch:         opts.OptimizedFetch,
-		RetryFetches:           opts.RetryFetches,
-		NoCloneBundle:          opts.NoCloneBundle,
+		Jobs:              opts.Jobs,
+		JobsNetwork:       opts.JobsNetwork,
+		JobsCheckout:      opts.JobsCheckout,
+		CurrentBranch:     currentBranch,
+		Detach:            opts.Detach,
+		ForceSync:         opts.ForceSync,
+		ForceRemoveDirty:  opts.ForceRemoveDirty,
+		ForceOverwrite:    opts.ForceOverwrite,
+		ForceBroken:       opts.ForceBroken,
+		LocalOnly:         opts.LocalOnly,
+		NetworkOnly:       opts.NetworkOnly,
+		Prune:             opts.Prune && !opts.NoPrune,
+		Quiet:             opts.Quiet,
+		Verbose:           opts.Verbose,
+		SmartSync:         opts.SmartSync,
+		SmartSyncOptional: opts.SmartSyncOptional,
+		Tags:              opts.Tags && !opts.NoTags,
+		NoTags:            opts.NoTags,
+		FetchSubmodules:   opts.FetchSubmodules || cfg.Submodules, // 命令行参数或配置文件
+		OptimizedFetch:    opts.OptimizedFetch,
+		RetryFetches:      opts.RetryFetches,
+		// --clone-bundle 显式开启时覆盖 --no-clone-bundle（对齐上游后写覆盖）；
+		// repo-go 不实现 /clone.bundle，该值仅用于保持命令行兼容。
+		NoCloneBundle:          opts.NoCloneBundle && !opts.CloneBundle,
 		Groups:                 groupsSlice, // 传递已处理的分组信息，确保只克隆指定组的仓
 		FailFast:               opts.FailFast,
 		NoManifestUpdate:       opts.NoManifestUpdate,
@@ -405,9 +447,9 @@ func runSync(opts *SyncOptions, args []string, log logger.Logger, cmd *cobra.Com
 	log.Info("开始同步项目，并行任务 %d...", opts.Jobs)
 	err = engine.Sync()
 
-	// 处理同步结果
+	// 处理同步结果：错误只返回，由 main 统一输出一次 "repo: error: ..."，
+	// 避免同一份（可能很长的）同步错误在 CI 日志里重复打印。
 	if err != nil {
-		log.Error("同步操作failed: %v", err)
 		return err
 	}
 

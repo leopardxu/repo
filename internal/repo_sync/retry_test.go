@@ -95,6 +95,16 @@ func TestIsRetryableGitErrorUsesStderr(t *testing.T) {
 			wantRetry: true,
 		},
 		{
+			name:      "ssh connection closed by remote host",
+			err:       &git.GitCommandError{Command: "git clone", Stderr: "kex_exchange_identification: Connection closed by remote host\nConnection closed by 10.128.0.11 port 22", ExitCode: 128},
+			wantRetry: true,
+		},
+		{
+			name:      "ssh connection reset by peer",
+			err:       &git.GitCommandError{Command: "git clone", Stderr: "kex_exchange_identification: read: Connection reset by peer", ExitCode: 128},
+			wantRetry: true,
+		},
+		{
 			name: "wrapped git error keeps chain",
 			err: fmt.Errorf("fetch failed: %w",
 				&git.GitCommandError{Command: "git fetch", Stderr: "Could not resolve host: example.com", ExitCode: 128}),

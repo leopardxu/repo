@@ -173,10 +173,17 @@ func isRetryableGitErrorText(text string) bool {
 		"connection refused",
 		"temporarily unavailable",
 		"connection reset by peer",
+		"connection closed by remote host",
+		"connection closed",
+		"kex_exchange_identification",
 		"failed to connect",
 		"operation timed out",
 		"temporary failure in name resolution",
 		"the remote end hung up unexpectedly",
+		"early eof",
+		"rpc failed",
+		"network is unreachable",
+		"no route to host",
 	}
 	for _, ne := range networkErrors {
 		if strings.Contains(lower, ne) {

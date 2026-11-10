@@ -174,6 +174,96 @@ func TestHandleSmartSyncManifestServerURLOverridesManifest(t *testing.T) {
 	}
 }
 
+// TestManifestServerRequestURL 验证清单服务器 scheme 规范化与上游一致：
+// http/https 原样、persistent-* 去前缀、helper 代理下任意 scheme 按 http 转发，
+// 无 helper 的不支持 scheme 立即报错。
+func TestManifestServerRequestURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		serverURL  string
+		withHelper bool
+		wantURL    string
+		wantErr    string
+	}{
+		{
+			name:      "http unchanged",
+			serverURL: "http://manifest.example.com/rpc",
+			wantURL:   "http://manifest.example.com/rpc",
+		},
+		{
+			name:      "https unchanged",
+			serverURL: "https://manifest.example.com/rpc",
+			wantURL:   "https://manifest.example.com/rpc",
+		},
+		{
+			name:      "persistent-http prefix stripped",
+			serverURL: "persistent-http://manifest.example.com/rpc",
+			wantURL:   "http://manifest.example.com/rpc",
+		},
+		{
+			name:      "persistent-https prefix stripped",
+			serverURL: "persistent-https://manifest.example.com/rpc",
+			wantURL:   "https://manifest.example.com/rpc",
+		},
+		{
+			name:       "persistent-https via helper uses http",
+			serverURL:  "persistent-https://manifest.example.com/rpc",
+			withHelper: true,
+			wantURL:    "http://manifest.example.com/rpc",
+		},
+		{
+			name:       "ssh via helper uses helper proxy over http",
+			serverURL:  "ssh://codereview.example.com/linux_repo/cix-manifest",
+			withHelper: true,
+			wantURL:    "http://codereview.example.com/linux_repo/cix-manifest",
+		},
+		{
+			name:      "ssh without helper rejected",
+			serverURL: "ssh://codereview.example.com/linux_repo/cix-manifest",
+			wantErr:   `unsupported manifest server scheme "ssh"`,
+		},
+		{
+			name:      "missing scheme rejected",
+			serverURL: "codereview.example.com/linux_repo/cix-manifest",
+			wantErr:   `unsupported manifest server scheme ""`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := manifestServerRequestURL(tt.serverURL, tt.withHelper)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("manifestServerRequestURL() error = %v, want contains %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("manifestServerRequestURL() error = %v", err)
+			}
+			if got != tt.wantURL {
+				t.Errorf("manifestServerRequestURL() = %q, want %q", got, tt.wantURL)
+			}
+		})
+	}
+}
+
+// TestHandleSmartSyncRejectsUnsupportedScheme 验证 ssh:// 等不支持的
+// 清单服务器 scheme 会在发请求前报错（不重试、不泄漏 Go 的
+// "unsupported protocol scheme" 底层错误）。
+func TestHandleSmartSyncRejectsUnsupportedScheme(t *testing.T) {
+	e := newSmartSyncTestEngine(&Options{
+		SmartSync:         true,
+		Quiet:             true,
+		ManifestServerURL: "ssh://codereview.example.com/linux_repo/cix-manifest",
+	}, &manifest.Manifest{Default: manifest.Default{Revision: "main"}})
+
+	err := e.handleSmartSync()
+	if err == nil || !strings.Contains(err.Error(), `unsupported manifest server scheme "ssh"`) {
+		t.Fatalf("ssh scheme 应立即报错，实际: %v", err)
+	}
+}
+
 // TestHandleSmartSyncExplicitRequiresServer 验证显式 -s/--smart-tag 缺少
 // manifest-server 时必须报错，不能静默退化为常规同步。
 func TestHandleSmartSyncExplicitRequiresServer(t *testing.T) {
@@ -192,6 +282,22 @@ func TestHandleSmartSyncExplicitRequiresServer(t *testing.T) {
 				t.Fatalf("显式智能同步缺少服务器应报错，实际: %v", err)
 			}
 		})
+	}
+}
+
+// TestHandleSmartSyncOptionalFallsBackWithoutServer 验证 repo smartsync
+// （SmartSyncOptional）在清单未配置 manifest-server 时不报错，退化为常规同步。
+func TestHandleSmartSyncOptionalFallsBackWithoutServer(t *testing.T) {
+	e := newSmartSyncTestEngine(&Options{
+		SmartSync:         true,
+		SmartSyncOptional: true,
+	}, &manifest.Manifest{Default: manifest.Default{Revision: "main"}})
+
+	if err := e.handleSmartSync(); err != nil {
+		t.Fatalf("smartsync 无 manifest-server 应回退常规同步，实际: %v", err)
+	}
+	if e.manifestCache != nil {
+		t.Error("回退时不应加载任何智能同步清单")
 	}
 }
 
